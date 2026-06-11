@@ -1,8 +1,9 @@
 """
 PayMatch by ProPayHR — Benefits Reconciliation Platform
 """
-import io, warnings, json, os, re, hashlib, secrets, smtplib
-from datetime import datetime, date, timedelta
+import io, warnings, os, re, hashlib, secrets, smtplib
+from datetime import datetime, date, timedelta, timezone
+from supabase import create_client, Client as SupabaseClient
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -26,10 +27,8 @@ AF   = {"OK":"E2EFDA","Add":"DDEBF7","Change":"FCE4D6","Review":"FFF2CC"}
 
 DISPLAY_COLS = ["Location","First Name","Last Name","Status","Benefit",
                 "Broker /pay","Paycor /pay","Difference /pay","Action","Note"]
-_APP_DIR       = os.path.dirname(os.path.abspath(__file__))
-HISTORY_FILE   = os.path.join(_APP_DIR, "history.xlsx")
-USERS_FILE     = os.path.join(_APP_DIR, "users.json")
-REPORTS_DIR    = os.path.join(_APP_DIR, "reports")
+_APP_DIR    = os.path.dirname(os.path.abspath(__file__))
+REPORTS_DIR = os.path.join(_APP_DIR, "reports")
 STATUS_OPTIONS = ["Incomplete", "In Progress", "Complete"]
 
 os.makedirs(REPORTS_DIR, exist_ok=True)  # ensure reports folder always exists
@@ -56,6 +55,22 @@ BUILTIN_CW = {
     "Hospital Indemnity Plan Employee Per Pay Cost":         "HospIND Amount",
     "Critical Illness":                                      "CritIll Amount",
 }
+
+# ── SUPABASE ──────────────────────────────────────────────────────
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zxxsmkfldqkmycbxlspe.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_ayiF1SjqjRAPV-HlCX-TrQ_jWzvGBa3")
+
+@st.cache_resource
+def _sb() -> SupabaseClient:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def _parse_dt(s):
+    if not s: return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 # ── FILE PARSERS ──────────────────────────────────────────────────
 def read_file(file):
@@ -282,150 +297,141 @@ def build_excel(df, client_name="Client"):
     allw.row_dimensions[8].height=8; _dh(allw,DISPLAY_COLS,9); _dr(allw,df,10)
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf.getvalue()
 
-# ── HISTORY ───────────────────────────────────────────────────────
+# ── HISTORY (Supabase) ────────────────────────────────────────────
 def save_to_history(recon_df, client_name, period, run_by="", excel_bytes=None):
-    ct={"OK":int((recon_df["Action"]=="OK").sum()),"Add":int(recon_df["Action"].str.startswith("Add").sum()),
-        "Change":int(recon_df["Action"].str.startswith("Change").sum()),"Review":int(recon_df["Action"].str.startswith("Review").sum())}
-    mo=round(recon_df[recon_df["Action"].str.startswith("Add")]["Broker /pay"].sum()*26/12,2)
-    # Save Excel file to disk (absolute path) for later re-download
+    ct = {
+        "OK":     int((recon_df["Action"] == "OK").sum()),
+        "Add":    int(recon_df["Action"].str.startswith("Add").sum()),
+        "Change": int(recon_df["Action"].str.startswith("Change").sum()),
+        "Review": int(recon_df["Action"].str.startswith("Review").sum()),
+    }
+    mo = round(recon_df[recon_df["Action"].str.startswith("Add")]["Broker /pay"].sum() * 26 / 12, 2)
     report_file = ""
     if excel_bytes:
-        safe = client_name.strip().replace(' ','_').replace('/','_')
-        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe = client_name.strip().replace(" ", "_").replace("/", "_")
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         report_file = os.path.join(REPORTS_DIR, f"PayMatch_{safe}_{period.replace(' ','_')}_{ts}.xlsx")
-        with open(report_file, 'wb') as f: f.write(excel_bytes)
-    new_row={"Period":period,"Client":client_name,"Run By":run_by,
-        "Run Date":datetime.now().strftime("%Y-%m-%d"),
-        "Run Time":datetime.now().strftime("%I:%M %p"),
-        "Total Lines":len(recon_df),"OK":ct["OK"],"Add":ct["Add"],"Change":ct["Change"],"Review":ct["Review"],
-        "Discrepancies":ct["Add"]+ct["Change"]+ct["Review"],"Monthly $ at stake":mo,
-        "Status":"Incomplete","Report File":report_file,"Notes":""}
+        with open(report_file, "wb") as f:
+            f.write(excel_bytes)
     try:
-        existing=pd.read_excel(HISTORY_FILE)
-        # Ensure columns exist for backward compat
-        if "Status" not in existing.columns: existing["Status"] = "Incomplete"
-        if "Report File" not in existing.columns: existing["Report File"] = ""
-        # Preserve notes from any previous run for this client+period
-        if "Notes" not in existing.columns: existing["Notes"] = ""
-        old_mask = (existing["Client"]==client_name) & (existing["Period"]==period)
-        if old_mask.any():
-            old_notes = existing.loc[old_mask, "Notes"].iloc[0]
-            new_row["Notes"] = "" if pd.isna(old_notes) else str(old_notes)
-        existing=existing[~old_mask]
-        out=pd.concat([existing,pd.DataFrame([new_row])],ignore_index=True)
-        # Keep Notes/Status as object dtype so they survive Excel round-trips without becoming float64
-        out["Notes"]=out["Notes"].astype(object).fillna("")
-        out["Status"]=out["Status"].astype(object).fillna("Incomplete")
-        out.to_excel(HISTORY_FILE,index=False)
-    except FileNotFoundError:
-        pd.DataFrame([new_row]).to_excel(HISTORY_FILE,index=False)
+        existing = _sb().table("reconciliation_history").select("id,notes").eq("client", client_name).eq("period", period).execute()
+        row = {
+            "client": client_name, "period": period, "run_by": run_by,
+            "run_date": datetime.now().strftime("%Y-%m-%d"),
+            "run_time": datetime.now().strftime("%I:%M %p"),
+            "total_lines": len(recon_df),
+            "ok_count": ct["OK"], "add_count": ct["Add"],
+            "change_count": ct["Change"], "review_count": ct["Review"],
+            "discrepancies": ct["Add"] + ct["Change"] + ct["Review"],
+            "monthly_at_stake": mo, "status": "Incomplete",
+            "report_file": report_file, "notes": "",
+        }
+        if existing.data:
+            row["notes"] = existing.data[0].get("notes", "") or ""
+            _sb().table("reconciliation_history").update(row).eq("client", client_name).eq("period", period).execute()
+        else:
+            _sb().table("reconciliation_history").insert(row).execute()
+    except Exception:
+        pass
 
 def load_history(client_name=None):
     try:
-        df=pd.read_excel(HISTORY_FILE)
-        if "Status" not in df.columns: df["Status"] = "Incomplete"
-        if "Report File" not in df.columns: df["Report File"] = ""
-        if "Notes" not in df.columns: df["Notes"] = ""
+        q = _sb().table("reconciliation_history").select("*").order("run_date", desc=True)
         if client_name:
-            df=df[df["Client"]==client_name]
-        return df.sort_values("Run Date",ascending=False).reset_index(drop=True)
-    except FileNotFoundError:
+            q = q.eq("client", client_name)
+        res = q.execute()
+        if not res.data:
+            return pd.DataFrame()
+        return pd.DataFrame(res.data).rename(columns={
+            "ok_count": "OK", "add_count": "Add", "change_count": "Change",
+            "review_count": "Review", "total_lines": "Total Lines",
+            "monthly_at_stake": "Monthly $ at stake", "run_by": "Run By",
+            "run_date": "Run Date", "run_time": "Run Time",
+            "report_file": "Report File", "client": "Client",
+            "period": "Period", "notes": "Notes", "status": "Status",
+        }).reset_index(drop=True)
+    except Exception:
         return pd.DataFrame()
 
 def update_run_status(run_date, client, period, status):
     try:
-        df=pd.read_excel(HISTORY_FILE)
-        if "Status" not in df.columns: df["Status"] = "Incomplete"
-        # Cast to object so string assignment works even when column dtype is float64
-        df["Status"] = df["Status"].astype(object).fillna("Incomplete")
-        mask=(df["Run Date"].astype(str)==str(run_date)) & (df["Client"]==client) & (df["Period"]==period)
-        df.loc[mask,"Status"]=str(status)
-        df.to_excel(HISTORY_FILE,index=False)
-    except Exception: pass
+        _sb().table("reconciliation_history").update({"status": status}).eq("run_date", str(run_date)).eq("client", client).eq("period", period).execute()
+    except Exception:
+        pass
 
 def delete_run(run_date, client, period, report_file=""):
     try:
-        df=pd.read_excel(HISTORY_FILE)
-        mask=(df["Run Date"].astype(str)==str(run_date)) & (df["Client"]==client) & (df["Period"]==period)
-        df=df[~mask]
-        df.to_excel(HISTORY_FILE,index=False)
-    except Exception: pass
+        _sb().table("reconciliation_history").delete().eq("run_date", str(run_date)).eq("client", client).eq("period", period).execute()
+    except Exception:
+        pass
     if report_file:
         rf = report_file if os.path.isabs(report_file) else os.path.join(_APP_DIR, report_file)
         if os.path.exists(rf):
             try: os.remove(rf)
             except Exception: pass
 
-# ── USER MANAGEMENT ───────────────────────────────────────────────
+# ── USER MANAGEMENT (Supabase) ────────────────────────────────────
 def load_users():
-    if not os.path.exists(USERS_FILE): return []
     try:
-        with open(USERS_FILE) as f: return json.load(f).get("users", [])
-    except Exception: return []
+        res = _sb().table("profiles").select("*").execute()
+        return res.data or []
+    except Exception:
+        return []
 
-def save_users(users):
-    with open(USERS_FILE, "w") as f:
-        json.dump({"users": users}, f, indent=2, default=str)
+def get_user(email):
+    try:
+        res = _sb().table("profiles").select("*").eq("email", email.strip().lower()).execute()
+        return res.data[0] if res.data else None
+    except Exception:
+        return None
 
 def hash_pw(password, salt=None):
     if salt is None: salt = secrets.token_hex(32)
     return hashlib.sha256((salt + password).encode()).hexdigest(), salt
 
-def get_user(email):
-    for u in load_users():
-        if u["email"].lower() == email.strip().lower(): return u
-    return None
-
 def create_user(name, email, password):
     pw_hash, salt = hash_pw(password)
     code = f"{secrets.randbelow(900000) + 100000}"
-    existing = load_users()
-    is_admin = len(existing) == 0  # first registered user becomes admin
-    user = {"name": name, "email": email.strip().lower(),
-            "password_hash": pw_hash, "salt": salt,
-            "verified": False, "verification_code": code,
-            "reset_code": None, "is_admin": is_admin,
-            "failed_attempts": 0, "locked_until": None,
-            "created_at": datetime.now().isoformat()}
-    existing.append(user); save_users(existing)
-    return user
+    is_admin = len(load_users()) == 0
+    user = {
+        "name": name, "email": email.strip().lower(),
+        "password_hash": pw_hash, "salt": salt,
+        "verified": False, "verification_code": code,
+        "reset_code": None, "is_admin": is_admin,
+        "failed_attempts": 0, "locked_until": None,
+    }
+    res = _sb().table("profiles").insert(user).execute()
+    return res.data[0] if res.data else user
 
 def verify_user(email, code):
-    users = load_users()
-    for u in users:
-        if u["email"].lower()==email.lower() and str(u.get("verification_code",""))==str(code).strip():
-            u["verified"] = True; u["verification_code"] = None
-            save_users(users); return u
+    u = get_user(email)
+    if u and str(u.get("verification_code", "")) == str(code).strip():
+        _sb().table("profiles").update({"verified": True, "verification_code": None}).eq("email", email.lower()).execute()
+        return get_user(email)
     return None
 
 def generate_reset_code(email):
-    users = load_users()
-    for u in users:
-        if u["email"].lower() == email.strip().lower():
-            code = f"{secrets.randbelow(900000) + 100000}"
-            u["reset_code"] = code
-            save_users(users)
-            return u, code
-    return None, None
+    u = get_user(email)
+    if not u: return None, None
+    code = f"{secrets.randbelow(900000) + 100000}"
+    _sb().table("profiles").update({"reset_code": code}).eq("email", email.lower()).execute()
+    return get_user(email), code
 
 def apply_reset(email, code, new_pw):
-    users = load_users()
-    for u in users:
-        if u["email"].lower()==email.lower() and str(u.get("reset_code",""))==str(code).strip():
-            pw_hash, salt = hash_pw(new_pw)
-            u["password_hash"] = pw_hash; u["salt"] = salt
-            u["reset_code"] = None; u["verified"] = True
-            save_users(users); return u
+    u = get_user(email)
+    if u and str(u.get("reset_code", "")) == str(code).strip():
+        pw_hash, salt = hash_pw(new_pw)
+        _sb().table("profiles").update({
+            "password_hash": pw_hash, "salt": salt,
+            "reset_code": None, "verified": True,
+        }).eq("email", email.lower()).execute()
+        return get_user(email)
     return None
 
 def update_password(email, new_pw):
-    users = load_users()
-    for u in users:
-        if u["email"].lower() == email.lower():
-            pw_hash, salt = hash_pw(new_pw)
-            u["password_hash"] = pw_hash; u["salt"] = salt
-            save_users(users); return True
-    return False
+    pw_hash, salt = hash_pw(new_pw)
+    _sb().table("profiles").update({"password_hash": pw_hash, "salt": salt}).eq("email", email.lower()).execute()
+    return True
 
 def pw_checks(pw):
     return {
@@ -441,56 +447,44 @@ def pw_ok(pw): return all(pw_checks(pw).values())
 def check_account_locked(email):
     u = get_user(email)
     if not u: return False
-    locked = u.get("locked_until")
+    locked = _parse_dt(u.get("locked_until"))
     if not locked: return False
-    try:
-        lock_dt = datetime.fromisoformat(str(locked))
-        if datetime.now() < lock_dt: return lock_dt
-        _reset_lockout(email)
-    except Exception: pass
+    if datetime.now(timezone.utc) < locked:
+        return locked
+    _reset_lockout(email)
     return False
 
 def _reset_lockout(email):
-    users = load_users()
-    for u in users:
-        if u["email"].lower() == email.lower():
-            u["failed_attempts"] = 0; u["locked_until"] = None
-            save_users(users); break
+    try:
+        _sb().table("profiles").update({"failed_attempts": 0, "locked_until": None}).eq("email", email.lower()).execute()
+    except Exception:
+        pass
 
 def record_failed_attempt(email):
-    users = load_users()
-    for u in users:
-        if u["email"].lower() == email.lower():
-            attempts = u.get("failed_attempts", 0) + 1
-            u["failed_attempts"] = attempts
-            if attempts >= 5:
-                u["locked_until"] = (datetime.now() + timedelta(minutes=15)).isoformat()
-            save_users(users)
-            return attempts
-    return 1
+    u = get_user(email)
+    if not u: return 1
+    attempts = u.get("failed_attempts", 0) + 1
+    update_data = {"failed_attempts": attempts}
+    if attempts >= 5:
+        update_data["locked_until"] = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+    try:
+        _sb().table("profiles").update(update_data).eq("email", email.lower()).execute()
+    except Exception:
+        pass
+    return attempts
 
 def get_run_notes(client, period):
     try:
-        df = pd.read_excel(HISTORY_FILE)
-        if "Notes" not in df.columns: return ""
-        mask = (df["Client"]==client) & (df["Period"]==period)
-        if mask.any():
-            val = df.loc[mask, "Notes"].iloc[0]
-            return "" if pd.isna(val) else str(val)
-    except Exception: pass
-    return ""
+        res = _sb().table("reconciliation_history").select("notes").eq("client", client).eq("period", period).execute()
+        return (res.data[0].get("notes", "") or "") if res.data else ""
+    except Exception:
+        return ""
 
 def update_run_notes(client, period, notes):
     try:
-        df = pd.read_excel(HISTORY_FILE)
-        if "Notes" not in df.columns: df["Notes"] = ""
-        # Cast to object so string assignment works when column is float64 (all-NaN from Excel)
-        df["Notes"] = df["Notes"].astype(object).fillna("")
-        mask = (df["Client"]==client) & (df["Period"]==period)
-        if mask.any():
-            df.loc[mask, "Notes"] = str(notes)
-            df.to_excel(HISTORY_FILE, index=False)
-    except Exception: pass
+        _sb().table("reconciliation_history").update({"notes": str(notes)}).eq("client", client).eq("period", period).execute()
+    except Exception:
+        pass
 
 # ── EMAIL ─────────────────────────────────────────────────────────
 def send_code_email(to_email, name, code, subject="Your PayMatch verification code", heading="Verify your account"):
@@ -1160,7 +1154,7 @@ if not st.session_state.logged_in:
                     else:
                         lock_dt = check_account_locked(li_email)
                         if lock_dt:
-                            remaining = max(1, int((lock_dt - datetime.now()).total_seconds() // 60) + 1)
+                            remaining = max(1, int((lock_dt - datetime.now(timezone.utc)).total_seconds() // 60) + 1)
                             st.error(f"Account locked due to too many failed login attempts. Try again in {remaining} minute{'s' if remaining != 1 else ''}.")
                         else:
                             u = get_user(li_email)
@@ -1814,7 +1808,7 @@ else:
                     "Verified": "Yes" if _u.get("verified") else "No",
                     "Admin":    "Yes" if _u.get("is_admin") else "No",
                     "Runs":     _u_runs,
-                    "Locked":   "Yes" if _u.get("locked_until") and datetime.now() < datetime.fromisoformat(str(_u["locked_until"])) else "No",
+                    "Locked":   "Yes" if _parse_dt(_u.get("locked_until")) and datetime.now(timezone.utc) < _parse_dt(_u.get("locked_until")) else "No",
                 })
             if _urows:
                 st.dataframe(pd.DataFrame(_urows), use_container_width=True, hide_index=True)
@@ -1832,8 +1826,8 @@ else:
                 st.dataframe(_disp, use_container_width=True, hide_index=True)
 
                 # Admin unlock accounts
-                locked_users = [u for u in _all_users if u.get("locked_until") and
-                    datetime.now() < datetime.fromisoformat(str(u["locked_until"]))]
+                locked_users = [u for u in _all_users if _parse_dt(u.get("locked_until")) and
+                    datetime.now(timezone.utc) < _parse_dt(u.get("locked_until"))]
                 if locked_users:
                     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
                     st.markdown('<div class="slabel">Locked Accounts</div>', unsafe_allow_html=True)
