@@ -1,11 +1,15 @@
 """
 PayMatch by ProPayHR — Benefits Reconciliation Platform
 """
-import io, warnings, os, re, hashlib, secrets, smtplib
+import io, warnings, os, re, hashlib, secrets
 from datetime import datetime, date, timedelta, timezone
+from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from pydantic import BaseModel, field_validator
+from typing import Optional
+import resend
+
+load_dotenv()
 
 import pandas as pd
 import streamlit as st
@@ -57,8 +61,8 @@ BUILTIN_CW = {
 }
 
 # ── SUPABASE ──────────────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zxxsmkfldqkmycbxlspe.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_ayiF1SjqjRAPV-HlCX-TrQ_jWzvGBa3")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 @st.cache_resource
 def _sb() -> SupabaseClient:
@@ -71,6 +75,81 @@ def _parse_dt(s):
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+# ── PYDANTIC MODELS ───────────────────────────────────────────────
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password_hash: str
+    salt: str
+    verified: bool = False
+    verification_code: Optional[str] = None
+    reset_code: Optional[str] = None
+    is_admin: bool = False
+    failed_attempts: int = 0
+    locked_until: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Name cannot be empty")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def email_valid(cls, v: str) -> str:
+        v = v.strip().lower()
+        if "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("Invalid email address")
+        return v
+
+    @field_validator("failed_attempts")
+    @classmethod
+    def attempts_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("failed_attempts must be >= 0")
+        return v
+
+
+class ReconciliationRecord(BaseModel):
+    client: str
+    period: str
+    run_by: str
+    run_date: str
+    run_time: str
+    total_lines: int
+    ok_count: int
+    add_count: int
+    change_count: int
+    review_count: int
+    discrepancies: int
+    monthly_at_stake: float
+    status: str = "Incomplete"
+    report_file: str = ""
+    notes: str = ""
+
+    @field_validator("client", "period")
+    @classmethod
+    def not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Field cannot be empty")
+        return v.strip()
+
+    @field_validator("total_lines", "ok_count", "add_count", "change_count", "review_count", "discrepancies")
+    @classmethod
+    def non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("Count must be >= 0")
+        return v
+
+    @field_validator("monthly_at_stake")
+    @classmethod
+    def valid_amount(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("monthly_at_stake must be >= 0")
+        return round(v, 2)
 
 # ── FILE PARSERS ──────────────────────────────────────────────────
 def read_file(file):
@@ -315,17 +394,17 @@ def save_to_history(recon_df, client_name, period, run_by="", excel_bytes=None):
             f.write(excel_bytes)
     try:
         existing = _sb().table("reconciliation_history").select("id,notes").eq("client", client_name).eq("period", period).execute()
-        row = {
-            "client": client_name, "period": period, "run_by": run_by,
-            "run_date": datetime.now().strftime("%Y-%m-%d"),
-            "run_time": datetime.now().strftime("%I:%M %p"),
-            "total_lines": len(recon_df),
-            "ok_count": ct["OK"], "add_count": ct["Add"],
-            "change_count": ct["Change"], "review_count": ct["Review"],
-            "discrepancies": ct["Add"] + ct["Change"] + ct["Review"],
-            "monthly_at_stake": mo, "status": "Incomplete",
-            "report_file": report_file, "notes": "",
-        }
+        record = ReconciliationRecord(
+            client=client_name, period=period, run_by=run_by,
+            run_date=datetime.now().strftime("%Y-%m-%d"),
+            run_time=datetime.now().strftime("%I:%M %p"),
+            total_lines=len(recon_df),
+            ok_count=ct["OK"], add_count=ct["Add"],
+            change_count=ct["Change"], review_count=ct["Review"],
+            discrepancies=ct["Add"] + ct["Change"] + ct["Review"],
+            monthly_at_stake=mo, report_file=report_file, notes="",
+        )
+        row = record.model_dump()
         if existing.data:
             row["notes"] = existing.data[0].get("notes", "") or ""
             _sb().table("reconciliation_history").update(row).eq("client", client_name).eq("period", period).execute()
@@ -393,15 +472,16 @@ def create_user(name, email, password):
     pw_hash, salt = hash_pw(password)
     code = f"{secrets.randbelow(900000) + 100000}"
     is_admin = len(load_users()) == 0
-    user = {
-        "name": name, "email": email.strip().lower(),
-        "password_hash": pw_hash, "salt": salt,
-        "verified": False, "verification_code": code,
-        "reset_code": None, "is_admin": is_admin,
-        "failed_attempts": 0, "locked_until": None,
-    }
-    res = _sb().table("profiles").insert(user).execute()
-    return res.data[0] if res.data else user
+    user = UserCreate(
+        name=name,
+        email=email.strip().lower(),
+        password_hash=pw_hash,
+        salt=salt,
+        verification_code=code,
+        is_admin=is_admin,
+    )
+    res = _sb().table("profiles").insert(user.model_dump()).execute()
+    return res.data[0] if res.data else user.model_dump()
 
 def verify_user(email, code):
     u = get_user(email)
@@ -486,16 +566,14 @@ def update_run_notes(client, period, notes):
     except Exception:
         pass
 
-# ── EMAIL ─────────────────────────────────────────────────────────
+# ── EMAIL (Resend) ────────────────────────────────────────────────
 def send_code_email(to_email, name, code, subject="Your PayMatch verification code", heading="Verify your account"):
-    host=os.getenv("SMTP_HOST",""); port=int(os.getenv("SMTP_PORT","587"))
-    user=os.getenv("SMTP_USER",""); pw=os.getenv("SMTP_PASS","")
-    if not host or not user: return False
-    try:
-        msg=MIMEMultipart("alternative")
-        msg["Subject"]=subject
-        msg["From"]=f"PayMatch <{user}>"; msg["To"]=to_email
-        html=f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:#F5EFED;font-family:Lexend,Inter,-apple-system,sans-serif;">
+    api_key = os.getenv("RESEND_API_KEY", "")
+    if not api_key:
+        return False
+    resend.api_key = api_key
+    from_addr = os.getenv("RESEND_FROM", "PayMatch <onboarding@resend.dev>")
+    html = f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:#F5EFED;font-family:Lexend,Inter,-apple-system,sans-serif;">
 <div style="max-width:480px;margin:40px auto;background:white;border-radius:18px;overflow:hidden;box-shadow:0 4px 32px rgba(61,8,18,0.14);">
 <div style="background:linear-gradient(135deg,#3D0812,#5C1020,#8B1A2F);padding:28px;text-align:center;">
   <span style="font-size:1.7rem;font-weight:800;color:white;letter-spacing:-0.04em;">Pay<span style="color:#E8C97A">Match</span></span>
@@ -513,12 +591,16 @@ def send_code_email(to_email, name, code, subject="Your PayMatch verification co
 <div style="background:#FAF5F5;padding:14px;text-align:center;border-top:1px solid #EADDD8;">
   <span style="color:#B09898;font-size:0.72rem;">PayMatch by ProPayHR &nbsp;·&nbsp; Benefits Reconciliation Platform</span>
 </div></div></body></html>"""
-        msg.attach(MIMEText(html,"html"))
-        with smtplib.SMTP(host,port) as s:
-            s.ehlo(); s.starttls(); s.login(user,pw)
-            s.sendmail(user,to_email,msg.as_string())
+    try:
+        resend.Emails.send({
+            "from": from_addr,
+            "to": [to_email],
+            "subject": subject,
+            "html": html,
+        })
         return True
-    except Exception: return False
+    except Exception:
+        return False
 
 # ─────────────────────────────────────────────────────────────────
 # STREAMLIT UI
