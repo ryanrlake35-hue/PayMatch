@@ -423,6 +423,7 @@ def load_history(client_name=None):
         return pd.DataFrame(res.data).rename(columns={
             "ok_count": "OK", "add_count": "Add", "change_count": "Change",
             "review_count": "Review", "total_lines": "Total Lines",
+            "discrepancies": "Discrepancies",
             "monthly_at_stake": "Monthly $ at stake", "run_by": "Run By",
             "run_date": "Run Date", "run_time": "Run Time",
             "report_file": "Report File", "client": "Client",
