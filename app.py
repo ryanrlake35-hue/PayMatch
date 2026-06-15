@@ -919,23 +919,52 @@ hr { border-color:#E8DDD8 !important; margin:1rem 0 !important; }
 
 /* ── Auth page ───────────────────────────────────── */
 [data-testid="stImage"] {
+    width: 100% !important;
     display: flex !important;
     justify-content: center !important;
-    background: linear-gradient(135deg, #1A0208 0%, #3D0812 60%, #5C1020 100%) !important;
-    border-radius: 18px !important;
-    padding: 1.1rem 2rem !important;
-    margin-bottom: 0.15rem !important;
-    box-shadow: 0 4px 24px rgba(26,2,8,0.30) !important;
+    align-items: center !important;
+    background: linear-gradient(160deg, #0D0304 0%, #1A0208 55%, #2A0810 100%) !important;
+    border-radius: 16px !important;
+    padding: 1.75rem 1.5rem !important;
+    margin-bottom: 1.25rem !important;
+    box-shadow: 0 6px 32px rgba(13,3,4,0.28) !important;
 }
-[data-testid="stImage"] img { max-height: 80px !important; width: auto !important; object-fit: contain !important; }
-.auth-logo { text-align:center; margin-bottom:1.25rem; padding-top:0; }
+[data-testid="stImage"] img {
+    mix-blend-mode: screen !important;
+    max-height: 68px !important;
+    width: auto !important;
+    object-fit: contain !important;
+}
+.auth-logo { text-align:center; margin-bottom:1.5rem; padding-top:0; }
 .auth-logotype { font-size:2.2rem; font-weight:800; color:#1A0A0F; letter-spacing:-0.04em; line-height:1; }
 .auth-logotype span { color:#8B1A2F; }
 .auth-tagline { color:#B09898; font-size:0.82rem; margin-top:0.35rem; letter-spacing:0.01em; }
+.auth-value { font-size:0.88rem; font-weight:500; color:#4A2A30; margin-top:0.65rem; letter-spacing:0.01em; line-height:1.5; font-style:italic; }
 .auth-title { font-size:1.15rem; font-weight:700; color:#1A0A0F; margin-bottom:0.28rem; text-align:center; }
 .auth-sub { color:#7D5A5E; font-size:0.84rem; margin-bottom:1.5rem; line-height:1.6; text-align:center; }
 .auth-switch { text-align:center; font-size:0.82rem; color:#7D5A5E; margin-top:1rem; padding-top:1rem; border-top:1px solid #F5EDEB; }
-.forgot-link { text-align:center; font-size:0.8rem; color:#8B1A2F; margin-top:0.4rem; cursor:pointer; font-weight:500; }
+/* ── Forgot password — text link via key-based CSS ── */
+.st-key-goto_forgot { display:flex !important; justify-content:center !important; margin-top:0.1rem !important; }
+.st-key-goto_forgot button {
+    background: none !important; border: none !important; box-shadow: none !important;
+    color: #8B1A2F !important; font-size: 0.82rem !important; font-weight: 500 !important;
+    padding: 0.25rem 0.5rem !important; width: auto !important; min-height: unset !important;
+    text-decoration: underline !important; text-underline-offset: 2px !important;
+    letter-spacing: 0 !important; transform: none !important;
+}
+.st-key-goto_forgot button:hover:not(:disabled) {
+    color: #5C1020 !important; background: none !important;
+    box-shadow: none !important; transform: none !important;
+}
+/* ── Guest button — ghost/secondary style ── */
+.st-key-guest_mode_btn button {
+    background: white !important; color: #5C1020 !important;
+    border: 1.5px solid #D4B8B8 !important; box-shadow: 0 1px 3px rgba(0,0,0,0.05) !important;
+}
+.st-key-guest_mode_btn button:hover:not(:disabled) {
+    background: #FAF5F5 !important; border-color: #C4A8A8 !important;
+    box-shadow: 0 1px 5px rgba(0,0,0,0.08) !important; transform: none !important;
+}
 .pw-reqs { background:#FAF5F5; border-radius:9px; padding:0.75rem 1rem; margin-top:0.4rem; border:1px solid #E8DDD8; }
 .pw-req { display:flex; align-items:center; gap:0.4rem; font-size:0.78rem; margin-bottom:0.2rem; line-height:1; }
 .pw-req:last-child { margin-bottom:0; }
@@ -1051,6 +1080,15 @@ hr { border-color:#E8DDD8 !important; margin:1rem 0 !important; }
 }
 
 /* ── Streamlit tabs ──────────────────────────────── */
+/* ── Auth form card ── */
+[data-testid="stTabs"] {
+    background: white !important;
+    border-radius: 16px !important;
+    padding: 1.25rem 1.5rem 0.75rem !important;
+    box-shadow: 0 1px 4px rgba(26,2,8,0.04), 0 12px 40px rgba(26,2,8,0.09) !important;
+    border: 1px solid #E8DDD8 !important;
+    margin-bottom: 0 !important;
+}
 .stTabs [data-baseweb="tab-list"] { gap:0; background:#F5EDEB; border-radius:9px; padding:3px; }
 .stTabs [data-baseweb="tab"] { border-radius:6px; font-size:0.86rem; font-weight:500; padding:0.5rem 1.35rem; color:#9D7075; }
 .stTabs [aria-selected="true"] { background:white !important; color:#1A0A0F !important; font-weight:700 !important; box-shadow:0 1px 3px rgba(26,2,8,0.08); }
@@ -1096,6 +1134,7 @@ if not st.session_state.logged_in:
         <div class="auth-logo">
             <div class="auth-logotype">Pay<span>Match</span></div>
             <div class="auth-tagline">Benefits Reconciliation Platform &nbsp;·&nbsp; by ProPayHR</div>
+            <div class="auth-value">Catch payroll errors before they cost you.</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1219,11 +1258,9 @@ if not st.session_state.logged_in:
                     li_pw    = st.text_input("Password", type="password", placeholder="Your password", key="li_pw")
                     submitted = st.form_submit_button("Sign In", use_container_width=True)
 
-                # Forgot password link (outside form)
-                st.markdown('<div class="forgot-link">', unsafe_allow_html=True)
+                # Forgot password — styled as text link via .st-key-goto_forgot CSS
                 if st.button("Forgot your password?", key="goto_forgot"):
                     st.session_state.auth_tab = "forgot"; st.rerun()
-                st.markdown('</div>', unsafe_allow_html=True)
 
                 if submitted:
                     if not li_email or not li_pw:
@@ -1297,7 +1334,7 @@ if not st.session_state.logged_in:
                         st.session_state.pending_code = None if sent else new_user["verification_code"]
                         st.rerun()
 
-            st.markdown('<div style="text-align:center;margin-top:1.1rem;color:#B09898;font-size:0.77rem;letter-spacing:0.01em;">or continue without an account</div>', unsafe_allow_html=True)
+            st.markdown('<div style="display:flex;align-items:center;gap:0.75rem;margin:1.35rem 0 0.9rem;"><div style="flex:1;height:1px;background:#E8DDD8;"></div><span style="font-size:0.72rem;color:#B09898;letter-spacing:0.08em;text-transform:uppercase;white-space:nowrap;">or continue without an account</span><div style="flex:1;height:1px;background:#E8DDD8;"></div></div>', unsafe_allow_html=True)
             _gc = st.columns(1)
             with _gc[0]:
                 if st.button("Try without an account  →", key="guest_mode_btn", type="secondary", use_container_width=True):
