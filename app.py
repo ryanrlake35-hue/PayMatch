@@ -918,19 +918,24 @@ hr { border-color:#E8DDD8 !important; margin:1rem 0 !important; }
 .dl-desc { font-size:0.8rem; color:#7D5A5E; margin-bottom:0.6rem; line-height:1.55; }
 
 /* ── Auth page ───────────────────────────────────── */
-.auth-logo { text-align:center; margin-bottom:1.85rem; padding-top:1rem; }
+[data-testid="stImage"] {
+    display: flex !important;
+    justify-content: center !important;
+    background: linear-gradient(135deg, #1A0208 0%, #3D0812 60%, #5C1020 100%) !important;
+    border-radius: 18px !important;
+    padding: 1.1rem 2rem !important;
+    margin-bottom: 0.15rem !important;
+    box-shadow: 0 4px 24px rgba(26,2,8,0.30) !important;
+}
+[data-testid="stImage"] img { max-height: 80px !important; width: auto !important; object-fit: contain !important; }
+.auth-logo { text-align:center; margin-bottom:1.25rem; padding-top:0; }
 .auth-logotype { font-size:2.2rem; font-weight:800; color:#1A0A0F; letter-spacing:-0.04em; line-height:1; }
 .auth-logotype span { color:#8B1A2F; }
 .auth-tagline { color:#B09898; font-size:0.82rem; margin-top:0.35rem; letter-spacing:0.01em; }
-.auth-card {
-    background:white; border-radius:18px; padding:2.1rem;
-    box-shadow:0 4px 40px rgba(26,2,8,0.12),0 1px 6px rgba(0,0,0,0.04);
-    border:1px solid #EADDD8;
-}
-.auth-title { font-size:1.15rem; font-weight:700; color:#1A0A0F; margin-bottom:0.28rem; }
-.auth-sub { color:#7D5A5E; font-size:0.84rem; margin-bottom:1.5rem; line-height:1.6; }
+.auth-title { font-size:1.15rem; font-weight:700; color:#1A0A0F; margin-bottom:0.28rem; text-align:center; }
+.auth-sub { color:#7D5A5E; font-size:0.84rem; margin-bottom:1.5rem; line-height:1.6; text-align:center; }
 .auth-switch { text-align:center; font-size:0.82rem; color:#7D5A5E; margin-top:1rem; padding-top:1rem; border-top:1px solid #F5EDEB; }
-.forgot-link { text-align:right; font-size:0.8rem; color:#8B1A2F; margin-top:0.4rem; cursor:pointer; font-weight:500; }
+.forgot-link { text-align:center; font-size:0.8rem; color:#8B1A2F; margin-top:0.4rem; cursor:pointer; font-weight:500; }
 .pw-reqs { background:#FAF5F5; border-radius:9px; padding:0.75rem 1rem; margin-top:0.4rem; border:1px solid #E8DDD8; }
 .pw-req { display:flex; align-items:center; gap:0.4rem; font-size:0.78rem; margin-bottom:0.2rem; line-height:1; }
 .pw-req:last-child { margin-bottom:0; }
@@ -1036,7 +1041,6 @@ hr { border-color:#E8DDD8 !important; margin:1rem 0 !important; }
   .pm-wordmark { font-size: 1.65rem !important; }
   .pm-chips { display: none !important; }
   .pm-sub { font-size: 0.78rem !important; }
-  .auth-card { padding: 1.35rem !important; }
   [data-testid="column"] { min-width: 100% !important; flex: none !important; }
   .stButton > button { min-height: 50px !important; font-size: 0.95rem !important; }
   [data-testid="stDownloadButton"] > button { min-height: 50px !important; }
@@ -1087,11 +1091,9 @@ if not st.session_state.logged_in:
     _, auth_col, _ = st.columns([1, 1.15, 1])
     with auth_col:
 
+        st.image("ProPayHR-2024-red-TRANSPARENT.png", width=150)
         st.markdown("""
         <div class="auth-logo">
-            <div style="display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;background:linear-gradient(135deg,#8B1A2F,#5C1020);border-radius:14px;margin-bottom:1rem;box-shadow:0 4px 16px rgba(139,26,47,0.35);">
-                <span style="font-size:1.1rem;font-weight:800;color:white;letter-spacing:-0.02em;">PM</span>
-            </div>
             <div class="auth-logotype">Pay<span>Match</span></div>
             <div class="auth-tagline">Benefits Reconciliation Platform &nbsp;·&nbsp; by ProPayHR</div>
         </div>
@@ -1099,7 +1101,6 @@ if not st.session_state.logged_in:
 
         # ── VERIFY ────────────────────────────────────────────────
         if st.session_state.auth_tab == "verify":
-            st.markdown('<div class="auth-card">', unsafe_allow_html=True)
             st.markdown('<div class="auth-title">Check your email</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="auth-sub">We sent a 6-digit code to <strong>{st.session_state.pending_email}</strong>. Enter it below to activate your account.</div>', unsafe_allow_html=True)
 
@@ -1131,11 +1132,9 @@ if not st.session_state.logged_in:
 
             if st.button("← Back to sign up", key="back_signup"):
                 st.session_state.auth_tab = "signup"; st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
 
         # ── FORGOT PASSWORD ───────────────────────────────────────
         elif st.session_state.auth_tab == "forgot":
-            st.markdown('<div class="auth-card">', unsafe_allow_html=True)
             st.markdown('<div class="auth-title">Reset your password</div>', unsafe_allow_html=True)
             st.markdown('<div class="auth-sub">Enter your email address and we\'ll send you a 6-digit reset code.</div>', unsafe_allow_html=True)
 
@@ -1158,11 +1157,9 @@ if not st.session_state.logged_in:
 
             if st.button("← Back to sign in", key="back_login_forgot"):
                 st.session_state.auth_tab = "login"; st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
 
         # ── RESET PASSWORD ────────────────────────────────────────
         elif st.session_state.auth_tab == "reset":
-            st.markdown('<div class="auth-card">', unsafe_allow_html=True)
             st.markdown('<div class="auth-title">Create new password</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="auth-sub">Enter the reset code sent to <strong>{st.session_state.pending_email}</strong> and choose a new password.</div>', unsafe_allow_html=True)
 
@@ -1207,11 +1204,9 @@ if not st.session_state.logged_in:
 
             if st.button("← Back", key="back_forgot"):
                 st.session_state.auth_tab = "forgot"; st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
 
         # ── LOGIN / SIGNUP TABS ───────────────────────────────────
         else:
-            st.markdown('<div class="auth-card">', unsafe_allow_html=True)
             login_tab, signup_tab = st.tabs(["Sign In", "Create Account"])
 
             with login_tab:
@@ -1301,8 +1296,6 @@ if not st.session_state.logged_in:
                         st.session_state.pending_email = new_user["email"]
                         st.session_state.pending_code = None if sent else new_user["verification_code"]
                         st.rerun()
-
-            st.markdown('</div>', unsafe_allow_html=True)
 
             st.markdown('<div style="text-align:center;margin-top:1.1rem;color:#B09898;font-size:0.77rem;letter-spacing:0.01em;">or continue without an account</div>', unsafe_allow_html=True)
             _gc = st.columns(1)
