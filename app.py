@@ -1,7 +1,7 @@
 """
 PayMatch by ProPayHR — Benefits Reconciliation Platform
 """
-import io, warnings, os, re, hashlib, secrets
+import io, warnings, os, re, hashlib, secrets, threading, time
 from datetime import datetime, date, timedelta, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
@@ -85,7 +85,6 @@ class UserCreate(BaseModel):
     verified: bool = False
     verification_code: Optional[str] = None
     reset_code: Optional[str] = None
-    is_admin: bool = False
     failed_attempts: int = 0
     locked_until: Optional[str] = None
 
@@ -471,14 +470,12 @@ def hash_pw(password, salt=None):
 def create_user(name, email, password):
     pw_hash, salt = hash_pw(password)
     code = f"{secrets.randbelow(900000) + 100000}"
-    is_admin = len(load_users()) == 0
     user = UserCreate(
         name=name,
         email=email.strip().lower(),
         password_hash=pw_hash,
         salt=salt,
         verification_code=code,
-        is_admin=is_admin,
     )
     res = _sb().table("profiles").insert(user.model_dump()).execute()
     return res.data[0] if res.data else user.model_dump()
@@ -606,6 +603,19 @@ def send_code_email(to_email, name, code, subject="Your PayMatch verification co
 # STREAMLIT UI
 # ─────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PayMatch by ProPayHR", page_icon="📊", layout="wide")
+
+# ── KEEP-ALIVE ────────────────────────────────────────────────────
+@st.cache_resource
+def _start_keep_alive():
+    """Background thread keeps the Python process warm on Streamlit Cloud."""
+    def _loop():
+        while True:
+            time.sleep(60)
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
+
+_start_keep_alive()
 
 st.markdown("""
 <style>
@@ -1001,17 +1011,6 @@ hr { border-color:#E8DDD8 !important; margin:1rem 0 !important; }
 .notes-label { font-size:0.6rem; font-weight:700; letter-spacing:0.16em; text-transform:uppercase; color:#8B1A2F; margin-bottom:0.55rem; }
 .hist-note { font-size:0.78rem; color:#7D5A5E; font-style:italic; padding:0.2rem 0 0.35rem 0.5rem; display:flex; gap:0.4rem; align-items:flex-start; }
 
-/* ── Admin page ──────────────────────────────────── */
-.admin-stat {
-    background:linear-gradient(135deg,#3D0812 0%,#6B1423 50%,#8B1A2F 100%);
-    border-radius:14px; padding:1.35rem 1.5rem; color:white; text-align:center;
-    box-shadow:0 4px 20px rgba(61,8,18,0.25);
-    border: 1px solid rgba(196,151,58,0.2);
-}
-.admin-stat-val { font-size:1.9rem; font-weight:800; letter-spacing:-0.03em; }
-.admin-stat-lbl { font-size:0.66rem; font-weight:700; text-transform:uppercase; letter-spacing:0.12em; color:rgba(255,255,255,0.48); margin-top:0.25rem; }
-.admin-badge { display:inline-flex; align-items:center; gap:0.3rem; background:#FEF3C7; color:#92400E; border:1px solid #FDE68A; border-radius:20px; padding:0.15rem 0.55rem; font-size:0.68rem; font-weight:700; }
-
 /* ── Footer ──────────────────────────────────────── */
 .pm-footer {
     text-align:center; color:#B09898; font-size:0.73rem;
@@ -1070,6 +1069,7 @@ _defaults = {
     "delete_confirm_key": None,
     "last_activity": None,
     "session_expired": False,
+    "guest_mode": False,
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -1304,15 +1304,32 @@ if not st.session_state.logged_in:
 
             st.markdown('</div>', unsafe_allow_html=True)
 
+            st.markdown('<div style="text-align:center;margin-top:1.1rem;color:#B09898;font-size:0.77rem;letter-spacing:0.01em;">or continue without an account</div>', unsafe_allow_html=True)
+            _gc = st.columns(1)
+            with _gc[0]:
+                if st.button("Try without an account  →", key="guest_mode_btn", type="secondary", use_container_width=True):
+                    st.session_state.logged_in = True
+                    st.session_state.guest_mode = True
+                    st.session_state.current_user = {"name": "Guest", "email": "", "verified": True}
+                    st.session_state.last_activity = datetime.now()
+                    st.rerun()
+            st.markdown("""
+            <div style="background:linear-gradient(135deg,#FDF8EC,#FDF4F0);border:1px solid #E8C97A;border-radius:10px;padding:0.7rem 1rem;margin-top:0.65rem;font-size:0.78rem;color:#8B6914;line-height:1.6;">
+                <strong style="color:#5C1020;">Guest mode:</strong> Run reconciliations and download reports instantly. Sign in for history, saved reports, and trend tracking.
+            </div>
+            """, unsafe_allow_html=True)
+
         st.markdown(f'<div style="text-align:center;color:#C0A8A8;font-size:0.73rem;margin-top:2rem;padding-bottom:1rem;letter-spacing:0.02em;"><strong style="color:#8B1A2F;">PayMatch</strong> by ProPayHR &nbsp;·&nbsp; Benefits Reconciliation Platform &nbsp;·&nbsp; {datetime.now().year}</div>', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────
 # MAIN APP (logged in)
 # ─────────────────────────────────────────────────────────────────
 else:
+    is_guest = st.session_state.get("guest_mode", False)
+
     # ── SESSION TIMEOUT ───────────────────────────────────────────
     _now = datetime.now()
-    if st.session_state.last_activity is not None:
+    if not is_guest and st.session_state.last_activity is not None:
         if (_now - st.session_state.last_activity).total_seconds() > 1800:
             for _k in list(st.session_state.keys()):
                 del st.session_state[_k]
@@ -1328,8 +1345,8 @@ else:
     with btn_col:
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
         if st.button("Sign Out", key="signout"):
-            for k in ["logged_in","current_user","recon_df","last_run_ts","page"]:
-                st.session_state[k] = (False if k=="logged_in" else (None if k!="page" else "app"))
+            for k in ["logged_in","current_user","recon_df","last_run_ts","page","guest_mode"]:
+                st.session_state[k] = (False if k in ("logged_in","guest_mode") else (None if k!="page" else "app"))
             st.rerun()
 
     with hdr_col:
@@ -1338,9 +1355,9 @@ else:
             <div class="pm-header-body">
                 <div class="pm-header-top">
                     <div class="pm-brand">ProPayHR &nbsp;·&nbsp; Enterprise Benefits Platform</div>
-                    <div class="pm-user-pill">
-                        <span class="pm-user-avatar">{initial}</span>
-                        {user["name"].split()[0]}
+                    <div class="pm-user-pill" style="{'background:rgba(196,151,58,0.15);border-color:rgba(196,151,58,0.35);' if is_guest else ''}">
+                        <span class="pm-user-avatar">{'G' if is_guest else initial}</span>
+                        {'Guest Mode' if is_guest else user["name"].split()[0]}
                     </div>
                 </div>
                 <div class="pm-logo-row">
@@ -1361,21 +1378,16 @@ else:
         """, unsafe_allow_html=True)
 
     # ── NAV ───────────────────────────────────────────────────────
-    _is_admin = user.get("is_admin", False)
-    _nav_cols = st.columns(3 if _is_admin else 2)
+    _nav_cols = st.columns(1 if is_guest else 2)
     with _nav_cols[0]:
         if st.button("Reconciliation", key="nav_app",
                      type="primary" if st.session_state.page=="app" else "secondary"):
             st.session_state.page = "app"; st.rerun()
-    with _nav_cols[1]:
-        if st.button("My Profile", key="nav_profile",
-                     type="primary" if st.session_state.page=="profile" else "secondary"):
-            st.session_state.page = "profile"; st.rerun()
-    if _is_admin:
-        with _nav_cols[2]:
-            if st.button("Admin", key="nav_admin",
-                         type="primary" if st.session_state.page=="admin" else "secondary"):
-                st.session_state.page = "admin"; st.rerun()
+    if not is_guest:
+        with _nav_cols[1]:
+            if st.button("My Profile", key="nav_profile",
+                         type="primary" if st.session_state.page=="profile" else "secondary"):
+                st.session_state.page = "profile"; st.rerun()
 
     st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
 
@@ -1384,8 +1396,16 @@ else:
     # ═════════════════════════════════════════════════════════════
     if st.session_state.page == "app":
 
-        first_name = user["name"].split()[0]
-        st.markdown(f'<div class="welcome-bar">Welcome back, <strong style="color:#3D0812;">{first_name}</strong>. Upload your files below to run a reconciliation. It only takes a moment.</div>', unsafe_allow_html=True)
+        if is_guest:
+            st.markdown("""
+            <div class="welcome-bar" style="border-left-color:#C4973A;background:linear-gradient(135deg,#FDF8EC,#FDFAF5);">
+                <strong style="color:#8B6914;">Guest Mode</strong> — Run a reconciliation and download your report below.
+                <span style="color:#9D7075;font-size:0.82rem;"> Sign in to save history and access reports anytime.</span>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            first_name = user["name"].split()[0]
+            st.markdown(f'<div class="welcome-bar">Welcome back, <strong style="color:#3D0812;">{first_name}</strong>. Upload your files below to run a reconciliation. It only takes a moment.</div>', unsafe_allow_html=True)
 
         # ── UPLOAD + CONFIG ───────────────────────────────────────
         left, right = st.columns([3, 2], gap="large")
@@ -1483,7 +1503,8 @@ else:
                     # Build Excel once — reuse for download buttons and local storage
                     _excel_full    = build_excel(recon_df, client_name.strip())
                     _excel_actions = build_action_items_only(recon_df, client_name.strip())
-                    save_to_history(recon_df, client_name.strip(), period, run_by=user["name"], excel_bytes=_excel_full)
+                    if not is_guest:
+                        save_to_history(recon_df, client_name.strip(), period, run_by=user["name"], excel_bytes=_excel_full)
 
                     if len(recon_df) == 0:
                         st.warning("No matching records found. Check that First Name and Last Name are spelled the same in both files, and that the Broker file has per-pay cost columns.")
@@ -1581,7 +1602,15 @@ else:
                     st.info("If the problem persists, verify that the Deduction Report is a Paycor export and the Master Mapping Report is the broker enrollment file with codes in row 2.")
 
         # ── TREND VIEW ────────────────────────────────────────────
-        if client_name.strip():
+        if is_guest and client_name.strip():
+            st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
+            st.markdown("""
+            <div style="background:linear-gradient(135deg,#FDF8EC,#FDF4F0);border:1px solid #E8C97A;border-radius:12px;padding:1.25rem 1.5rem;text-align:center;">
+                <div style="font-size:0.88rem;font-weight:700;color:#5C1020;margin-bottom:0.35rem;">Want to track this over time?</div>
+                <div style="font-size:0.8rem;color:#8B6914;line-height:1.65;">Create a free account to save run history, view month-over-month trends, add notes, and download reports at any time.</div>
+            </div>
+            """, unsafe_allow_html=True)
+        if not is_guest and client_name.strip():
             st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
             history_df = load_history(client_name.strip())
 
@@ -1843,86 +1872,9 @@ else:
         _, lo_col, _ = st.columns([2, 1, 2])
         with lo_col:
             if st.button("Sign Out", key="signout_profile"):
-                for k in ["logged_in","current_user","recon_df","last_run_ts","page"]:
-                    st.session_state[k] = (False if k=="logged_in" else (None if k!="page" else "app"))
+                for k in ["logged_in","current_user","recon_df","last_run_ts","page","guest_mode"]:
+                    st.session_state[k] = (False if k in ("logged_in","guest_mode") else (None if k!="page" else "app"))
                 st.rerun()
-
-    # ═════════════════════════════════════════════════════════════
-    # PAGE: ADMIN
-    # ═════════════════════════════════════════════════════════════
-    elif st.session_state.page == "admin":
-        if not user.get("is_admin", False):
-            st.error("You don't have permission to view this page.")
-        else:
-            st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-            st.markdown('<div class="slabel">Admin Dashboard</div>', unsafe_allow_html=True)
-            st.markdown('<div class="sdesc">Platform-wide overview across all users and reconciliation runs.</div>', unsafe_allow_html=True)
-
-            _all_users = load_users()
-            _all_hist  = load_history()
-            _u_count   = len(_all_users)
-            _r_count   = len(_all_hist)
-            _l_count   = int(_all_hist["Total Lines"].sum()) if _r_count > 0 else 0
-            _d_count   = int(_all_hist["Discrepancies"].sum()) if _r_count > 0 else 0
-            _mo_total  = float(_all_hist["Monthly $ at stake"].sum()) if _r_count > 0 else 0.0
-
-            # Platform stats
-            ac1,ac2,ac3,ac4,ac5 = st.columns(5)
-            for _col, _val, _lbl in [
-                (ac1, _u_count,           "Users"),
-                (ac2, _r_count,           "Total Runs"),
-                (ac3, f"{_l_count:,}",    "Lines Processed"),
-                (ac4, f"{_d_count:,}",    "Discrepancies"),
-                (ac5, f"${_mo_total:,.2f}","Monthly $ Found"),
-            ]:
-                _col.markdown(f'<div class="admin-stat"><div class="admin-stat-val">{_val}</div><div class="admin-stat-lbl">{_lbl}</div></div>', unsafe_allow_html=True)
-
-            # Users table
-            st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-            st.markdown('<div class="slabel">All Users</div>', unsafe_allow_html=True)
-            _urows = []
-            for _u in _all_users:
-                _u_runs = len(_all_hist[_all_hist["Run By"]==_u["name"]]) if _r_count > 0 else 0
-                _urows.append({
-                    "Name":     _u["name"],
-                    "Email":    _u["email"],
-                    "Member Since": str(_u.get("created_at",""))[:10],
-                    "Verified": "Yes" if _u.get("verified") else "No",
-                    "Admin":    "Yes" if _u.get("is_admin") else "No",
-                    "Runs":     _u_runs,
-                    "Locked":   "Yes" if _parse_dt(_u.get("locked_until")) and datetime.now(timezone.utc) < _parse_dt(_u.get("locked_until")) else "No",
-                })
-            if _urows:
-                st.dataframe(pd.DataFrame(_urows), use_container_width=True, hide_index=True)
-            else:
-                st.info("No users yet.")
-
-            # All runs
-            st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
-            st.markdown('<div class="slabel">All Reconciliation Runs</div>', unsafe_allow_html=True)
-            if _r_count > 0:
-                _show_cols = [c for c in ["Run Date","Run Time","Client","Period","Run By","Total Lines","Discrepancies","Monthly $ at stake","Status","Notes"] if c in _all_hist.columns]
-                _disp = _all_hist[_show_cols].copy()
-                if "Monthly $ at stake" in _disp.columns:
-                    _disp["Monthly $ at stake"] = _disp["Monthly $ at stake"].apply(lambda x: f"${x:,.2f}")
-                st.dataframe(_disp, use_container_width=True, hide_index=True)
-
-                # Admin unlock accounts
-                locked_users = [u for u in _all_users if _parse_dt(u.get("locked_until")) and
-                    datetime.now(timezone.utc) < _parse_dt(u.get("locked_until"))]
-                if locked_users:
-                    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-                    st.markdown('<div class="slabel">Locked Accounts</div>', unsafe_allow_html=True)
-                    for _lu in locked_users:
-                        _lc1, _lc2 = st.columns([4, 1])
-                        _lc1.markdown(f'<div style="font-size:0.84rem;color:#1A0A0F;padding-top:0.4rem;"><strong>{_lu["name"]}</strong> ({_lu["email"]}) — locked until {str(_lu["locked_until"])[:16]}</div>', unsafe_allow_html=True)
-                        with _lc2:
-                            if st.button("Unlock", key=f"unlock_{_lu['email']}"):
-                                _reset_lockout(_lu["email"])
-                                st.success(f"Unlocked {_lu['name']}.")
-                                st.rerun()
-            else:
-                st.info("No reconciliation runs yet across the platform.")
 
     # ── FOOTER ────────────────────────────────────────────────────
     st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
@@ -1930,4 +1882,14 @@ else:
     <div class="pm-footer">
         <strong>PayMatch</strong> by ProPayHR &nbsp;·&nbsp; Benefits Reconciliation Platform &nbsp;·&nbsp; {datetime.now().year}
     </div>
+    <script>
+    (function(){{
+        if(!window.__pmAlive){{
+            window.__pmAlive = true;
+            setInterval(function(){{
+                try{{fetch(window.location.origin + window.location.pathname, {{method:'HEAD', mode:'no-cors', cache:'no-store'}})}}catch(e){{}}
+            }}, 45000);
+        }}
+    }})();
+    </script>
     """, unsafe_allow_html=True)
