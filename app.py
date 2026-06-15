@@ -1430,7 +1430,7 @@ else:
             st.markdown("""
             <div class="card">
                 <div class="utitle"><span class="ustep">2</span>Master Mapping Report<span class="utag">Broker</span></div>
-                <div class="udesc">Enrollment file from your broker. Row 2 must contain benefit codes — PayMatch reads them automatically to match columns. Accepted formats: .xlsx, .xls, .csv</div>
+                <div class="udesc">Enrollment export from your broker. The second row should contain benefit labels — PayMatch uses them to automatically find and compare the right columns. Accepted formats: .xlsx, .xls, .csv</div>
             </div>
             """, unsafe_allow_html=True)
             broker_file = st.file_uploader("Master Mapping Report", type=["xlsx","xls","csv"],
@@ -1440,11 +1440,10 @@ else:
 
         with right:
             st.markdown('<div class="slabel">Configuration</div>', unsafe_allow_html=True)
-            st.markdown('<div class="sdesc">Fill in the client name and select the billing period before running. These appear in the report and track history.</div>', unsafe_allow_html=True)
-            st.markdown('<div class="spanel">', unsafe_allow_html=True)
+            st.markdown('<div class="sdesc">Enter the client name and choose the month you\'re reconciling. This labels your report and saves the run to your history.</div>', unsafe_allow_html=True)
 
             client_name = st.text_input("Client Name", value="", placeholder="e.g. Acme Corporation",
-                help="Enter the client this reconciliation is for.")
+                help="The name of the client this reconciliation is for. It will appear in the report header.")
 
             mo_col, yr_col = st.columns(2)
             with mo_col:
@@ -1455,19 +1454,19 @@ else:
                     value=datetime.now().year, step=1, key="period_year", format="%d")
             period = f"{sel_month} {int(sel_year)}"
 
-            tolerance = st.number_input("Match Tolerance ($)", min_value=0.0, max_value=1.0,
+            tolerance = st.number_input("Acceptable Difference ($)", min_value=0.0, max_value=1.0,
                 value=0.05, step=0.01,
-                help="Differences within this amount count as a match — handles rounding.")
+                help="Two amounts this close to each other will be treated as a match.")
+            st.markdown('<div style="font-size:0.78rem;color:#7D5A5E;line-height:1.55;margin-top:0.3rem;margin-bottom:0.6rem;">How close two dollar amounts need to be to count as a match. The default ($0.05) works for most cases — it accounts for small rounding differences between systems.</div>', unsafe_allow_html=True)
 
             st.markdown("""
             <div class="info-box">
                 <b>How PayMatch works</b>
-                Both files use per-paycheck amounts and are compared directly — no conversion needed.
-                Benefit codes are detected automatically from row 2 of the Broker file.
-                Results: green = match, blue = missing deduction, orange = wrong amount, yellow = needs review.
+                Both files use per-paycheck dollar amounts and are compared directly — no math needed on your end.
+                Benefit labels are read automatically from your enrollment file, so nothing needs to be set up manually.
+                Results: green = match, blue = missing deduction, orange = amount differs, yellow = needs manual review.
             </div>
             """, unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
         st.divider()
@@ -1495,7 +1494,7 @@ else:
                         st.error(f"The Deduction Report ({paycor_file.name}) appears to be empty or couldn't be read. Make sure it's a valid Paycor export with at least one row of data.")
                         st.stop()
                     if len(broker_df) == 0:
-                        st.error(f"The Master Mapping Report ({broker_file.name}) appears to be empty or couldn't be read. Make sure row 1 contains benefit codes and employee data starts at row 2.")
+                        st.error(f"The Master Mapping Report ({broker_file.name}) appears to be empty or couldn't be read. Make sure the file has benefit labels in the second row and employee data below that.")
                         st.stop()
                     recon_df = reconcile(broker_df, paycor_df, crosswalk, tolerance)
                     st.session_state.recon_df = recon_df
@@ -1507,7 +1506,7 @@ else:
                         save_to_history(recon_df, client_name.strip(), period, run_by=user["name"], excel_bytes=_excel_full)
 
                     if len(recon_df) == 0:
-                        st.warning("No matching records found. Check that First Name and Last Name are spelled the same in both files, and that the Broker file has per-pay cost columns.")
+                        st.warning("No matching employees found. Make sure first and last names are spelled the same way in both files, and that the enrollment file includes per-paycheck dollar amounts.")
                     else:
                         total   = len(recon_df)
                         n_ok    = int((recon_df["Action"]=="OK").sum())
@@ -1592,14 +1591,14 @@ else:
                 except Exception as e:
                     err_str = str(e).lower()
                     if "no sheet" in err_str or "worksheet" in err_str:
-                        st.error("Couldn't read one of the files — it may be password-protected or use an unusual sheet structure. Try exporting a fresh copy from Paycor or your broker.")
+                        st.error("Couldn't read one of the files — it may be password-protected or have an unexpected layout. Try exporting a fresh copy from Paycor or your broker.")
                     elif "codec" in err_str or "decode" in err_str or "encoding" in err_str:
-                        st.error("One of the files has an encoding issue. If it's a CSV, try saving it as UTF-8 from Excel first.")
+                        st.error("One of the files couldn't be opened correctly. If it's a CSV file, try opening it in Excel and saving it again before uploading.")
                     elif "column" in err_str or "key" in err_str:
-                        st.error("A required column couldn't be found. Make sure the Deduction Report came from Paycor and the Broker file has employee names in 'First Name' and 'Last Name' columns.")
+                        st.error("A required column couldn't be found. Make sure the Deduction Report is a standard Paycor export and the enrollment file has employee names in columns labeled 'First Name' and 'Last Name'.")
                     else:
                         st.error(f"Something went wrong while processing: {e}")
-                    st.info("If the problem persists, verify that the Deduction Report is a Paycor export and the Master Mapping Report is the broker enrollment file with codes in row 2.")
+                    st.info("If the problem persists, double-check that the Deduction Report is from Paycor and the Master Mapping Report is your broker's enrollment file with benefit labels in the second row.")
 
         # ── TREND VIEW ────────────────────────────────────────────
         if is_guest and client_name.strip():
