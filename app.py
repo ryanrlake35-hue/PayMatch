@@ -56,6 +56,54 @@ BUILTIN_CW = {
     "Critical Illness":                                      "CritIll Amount",
 }
 
+BENEFIT_TO_OLD_BLOCK = {
+    "Medical":                         ("Medical Plan",                        "Medical - medical metlife"),
+    "Dental":                          ("Dental Plan",                         "Dental - dental metlife"),
+    "Vision":                          ("Vision Plan",                        "Vis - Vision metlife"),
+    "Voluntary Long-Term Disability":  ("Voluntary Long-Term Disability Plan", "LongTermD - LongTerm Disability Metlife"),
+    "Voluntary Short-Term Disability": ("Voluntary Short-Term Disability Plan","ShortTermD - Short Term Disability- Metlife"),
+    "Accident":                        ("Accident Plan",                      "Acc - Accident Metlife"),
+    "Identity Protection":             ("Identity Protection Plan",           "ID Protect - ID Protect met Life"),
+    "Legal":                           ("Legal Plan",                         "Legal - Legal Metlife"),
+    "Hospital Indemnity":              ("Hospital Indemnity Plan",            "Hosp IND - Hospital Indemnity Metlife"),
+    "Critical Illness":                ("Critical Illness",                   "CritIl - Critical Illness Metlife"),
+    "Voluntary Life":                  ("Voluntary Life Plan",                None),
+}
+
+_LONG_FORMAT_ID_COLS = ["Social Security Number", "First Name", "Last Name", "Sex", "DOB",
+                        "Class", "Division", "Employment Status", "Hire Date",
+                        "Address 1", "Address 2", "City", "State", "Zip"]
+
+def _is_long_format_broker(df):
+    cols = {str(c).strip() for c in df.columns}
+    return {"Benefit", "EE Cost", "Plan"}.issubset(cols)
+
+def _convert_broker_long_to_wide(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    id_col = "Social Security Number"
+    base = df.drop_duplicates(subset=[id_col], keep="first")[
+        [c for c in _LONG_FORMAT_ID_COLS if c in df.columns]
+    ].reset_index(drop=True)
+    wide = base.copy()
+    mapping_row = {}
+    for benefit_name, (old_prefix, cw_label) in BENEFIT_TO_OLD_BLOCK.items():
+        sub = df[df["Benefit"] == benefit_name]
+        if sub.empty:
+            continue
+        sub = sub.drop_duplicates(subset=[id_col], keep="first").set_index(id_col)
+        plan_col, cov_col, start_col, cost_col = (
+            old_prefix, f"{old_prefix} Coverage",
+            f"{old_prefix} Start Date", f"{old_prefix} Employee Per Pay Cost",
+        )
+        wide[plan_col]  = wide[id_col].map(sub["Plan"]) if "Plan" in sub.columns else None
+        wide[cov_col]   = wide[id_col].map(sub["Coverage Level"]) if "Coverage Level" in sub.columns else None
+        wide[start_col] = wide[id_col].map(sub["Coverage Start Date"]) if "Coverage Start Date" in sub.columns else None
+        wide[cost_col]  = wide[id_col].map(sub["EE Cost"]) if "EE Cost" in sub.columns else None
+        if cw_label:
+            mapping_row[plan_col] = cw_label
+    return wide, mapping_row
+
 # ── DESIGN SYSTEM CSS ─────────────────────────────────────────────
 APP_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;1,9..144,300;1,9..144,400&family=Inter:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
@@ -181,6 +229,7 @@ html, body, [class*="css"] {
     border-radius: 0;
     margin: 0 0 1.5rem;
     opacity: 0.9;
+    animation: pm-pulse 4s ease-in-out infinite;
 }
 
 /* ── SECTION LABELS ───────────────────────────────── */
@@ -261,6 +310,18 @@ html, body, [class*="css"] {
     padding-left: 2.05rem;
 }
 
+/* ── CARD HOVER + STEP CARD 3D TILT ──────────────── */
+.card { transition: transform 150ms ease; }
+.card:not(.pm-step-card):hover { transform: translateY(-1px); }
+.pm-step-card {
+    transition: transform 200ms ease;
+    transform-style: preserve-3d;
+    will-change: transform;
+}
+.pm-step-card:hover {
+    transform: perspective(600px) rotateY(4deg) rotateX(-2deg) translateY(-3px);
+}
+
 /* ── BUTTONS ──────────────────────────────────────── */
 .stButton > button {
     background: var(--burgundy) !important;
@@ -283,7 +344,7 @@ html, body, [class*="css"] {
     transform: translateY(-1px) !important;
 }
 .stButton > button:active:not(:disabled) {
-    transform: translateY(0) !important;
+    transform: scale(0.97) !important;
 }
 .stButton > button:disabled {
     opacity: 0.35 !important;
@@ -346,29 +407,46 @@ label, .stTextInput label, .stNumberInput label, .stSelectbox label {
     font-family: 'Inter', sans-serif !important;
 }
 
-/* ── METRICS ──────────────────────────────────────── */
-[data-testid="metric-container"] {
+/* ── METRIC TILES ─────────────────────────────────── */
+.pm-metrics {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 0.85rem;
+    margin: 1rem 0;
+}
+.pm-metric {
     background: var(--paper);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 1rem 1.2rem;
     border-top: 3px solid var(--burgundy);
 }
-[data-testid="stMetricLabel"] > div {
-    font-size: 0.65rem !important;
-    font-weight: 700 !important;
-    color: var(--text-soft) !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.13em !important;
-    font-family: 'Inter', sans-serif !important;
+.pm-metric-label {
+    font-size: 0.64rem;
+    font-weight: 700;
+    color: var(--text-soft);
+    text-transform: uppercase;
+    letter-spacing: 0.13em;
+    font-family: 'Inter', sans-serif;
+    margin-bottom: 0.3rem;
 }
-[data-testid="stMetricValue"] > div {
-    font-size: 1.8rem !important;
-    font-weight: 500 !important;
-    color: var(--ink) !important;
-    letter-spacing: -0.03em !important;
-    line-height: 1.1 !important;
-    font-family: 'IBM Plex Mono', monospace !important;
+.pm-metric-value {
+    font-size: 1.8rem;
+    font-weight: 500;
+    color: var(--ink);
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+    font-family: 'IBM Plex Mono', monospace;
+}
+@keyframes pm-pop {
+    0%   { opacity: 0; transform: scale(0.82); }
+    60%  { opacity: 1; transform: scale(1.05); }
+    100% { opacity: 1; transform: scale(1); }
+}
+.pm-countup {
+    display: inline-block;
+    font-variant-numeric: tabular-nums;
+    animation: pm-pop 350ms ease-out both;
 }
 
 /* ── STATUS BADGES (results table legend) ─────────── */
@@ -531,6 +609,12 @@ hr { border-color: var(--border) !important; margin: 1rem 0 !important; }
 }
 .stSpinner > div { border-top-color: var(--burgundy) !important; }
 
+/* ── ANIMATIONS ───────────────────────────────────── */
+@keyframes pm-pulse {
+    0%, 100% { opacity: 0.9; }
+    50%       { opacity: 0.6; }
+}
+
 /* ── MOBILE ───────────────────────────────────────── */
 @media (max-width: 768px) {
     .block-container { padding: 0.4rem 0.4rem 2rem !important; }
@@ -539,7 +623,18 @@ hr { border-color: var(--border) !important; margin: 1rem 0 !important; }
     .pm-chips { display: none !important; }
     .stButton > button { min-height: 50px !important; font-size: 0.95rem !important; }
     [data-testid="stDownloadButton"] > button { min-height: 50px !important; }
-    [data-testid="stMetricValue"] > div { font-size: 1.45rem !important; }
+    .pm-metrics { grid-template-columns: repeat(3, 1fr); }
+    .pm-metric-value { font-size: 1.4rem; }
+}
+
+/* ── REDUCED MOTION ───────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+    .gold-rule                           { animation: none !important; }
+    .pm-countup                          { animation: none !important; }
+    .pm-step-card, .pm-step-card:hover   { transition: none !important; transform: none !important; }
+    .card:not(.pm-step-card)             { transition: none !important; }
+    .stButton > button,
+    [data-testid="stDownloadButton"] > button { transition: none !important; }
 }
 """
 
@@ -608,6 +703,25 @@ def parse_paycor(file):
 def parse_broker_and_crosswalk(file):
     raw = read_file(file)
     raw.columns = [str(c).strip() for c in raw.columns]
+
+    if _is_long_format_broker(raw):
+        wide, mapping_row = _convert_broker_long_to_wide(raw)
+        cw = dict(BUILTIN_CW)
+        for col in wide.columns:
+            val = mapping_row.get(col, "")
+            if not val: continue
+            code = val.split(" - ")[0].strip().lower()
+            paycor_col = CODE_MAP.get(code)
+            for candidate in [
+                f"{col} Employee Per Pay Cost",
+                f"{col.replace(' Plan','')} Employee Per Pay Cost",
+                col,
+            ]:
+                if candidate in wide.columns and candidate not in cw:
+                    cw[candidate] = paycor_col; break
+        return wide.reset_index(drop=True), cw
+
+    # existing wide-format logic stays exactly as-is below this point
     mapping_row = raw.iloc[0]
     cw = dict(BUILTIN_CW)
     for col in raw.columns:
@@ -960,7 +1074,7 @@ with left:
     st.markdown('<div class="sdesc">Upload both files below, then click Run. PayMatch compares them line by line and flags every mismatch.</div>', unsafe_allow_html=True)
 
     st.markdown("""
-    <div class="card">
+    <div class="card pm-step-card">
         <div class="card-title">
             <span class="step-badge">1</span>
             Deduction Report
@@ -977,7 +1091,7 @@ with left:
     st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
 
     st.markdown("""
-    <div class="card">
+    <div class="card pm-step-card">
         <div class="card-title">
             <span class="step-badge">2</span>
             Master Mapping Report
@@ -1076,7 +1190,7 @@ if run:
                     st.markdown(f"""
                     <div class="res-bar">
                         <div>
-                            <div class="res-bar-ttl">Reconciliation Complete &nbsp;·&nbsp; {client_name} &nbsp;·&nbsp; {period}</div>
+                            <div class="res-bar-ttl">Reconciliation Complete &nbsp;·&nbsp; {client_name.strip()} &nbsp;·&nbsp; {period}</div>
                             <div class="res-bar-sub">{total:,} lines compared &nbsp;·&nbsp; {n_emps} employees with discrepancies</div>
                             <div class="run-ts">&#9201; Ran at {ts}</div>
                         </div>
@@ -1084,19 +1198,37 @@ if run:
                     </div>
                     """, unsafe_allow_html=True)
 
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Lines Compared", f"{total:,}")
-                c2.metric("Matched OK",     f"{n_ok:,}")
-                c3.metric("Add to Paycor",  f"{n_add:,}")
-                c4.metric("Amount Change",  f"{n_chg:,}")
-                c5.metric("Needs Review",   f"{n_rev:,}")
+                st.markdown(f"""
+                <div class="pm-metrics">
+                    <div class="pm-metric">
+                        <div class="pm-metric-label">Lines Compared</div>
+                        <div class="pm-metric-value"><span class="pm-countup">{total:,}</span></div>
+                    </div>
+                    <div class="pm-metric">
+                        <div class="pm-metric-label">Matched OK</div>
+                        <div class="pm-metric-value"><span class="pm-countup">{n_ok:,}</span></div>
+                    </div>
+                    <div class="pm-metric">
+                        <div class="pm-metric-label">Add to Paycor</div>
+                        <div class="pm-metric-value"><span class="pm-countup">{n_add:,}</span></div>
+                    </div>
+                    <div class="pm-metric">
+                        <div class="pm-metric-label">Amount Change</div>
+                        <div class="pm-metric-value"><span class="pm-countup">{n_chg:,}</span></div>
+                    </div>
+                    <div class="pm-metric">
+                        <div class="pm-metric-label">Needs Review</div>
+                        <div class="pm-metric-value"><span class="pm-countup">{n_rev:,}</span></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
                 if mo_var > 0:
                     st.markdown(f"""
                     <div class="urgency">
                         <div style="font-size:1.15rem;flex-shrink:0;margin-top:0.05rem;">&#9888;</div>
                         <div>
-                            <div class="urgency-amount">${mo_var:,.2f} / month not being collected</div>
+                            <div class="urgency-amount"><span class="pm-countup">${mo_var:,.2f}</span> / month not being collected</div>
                             <div class="urgency-note">{n_add} employees are enrolled with the broker but have no deduction set up in Paycor. These need to be corrected immediately to avoid further financial exposure.</div>
                         </div>
                     </div>
