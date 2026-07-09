@@ -1,7 +1,7 @@
 """
 PayMatch by ProPayHR — Benefits Reconciliation Platform
 """
-import base64, io, warnings, os, threading, time
+import base64, io, re, warnings, os, threading, time
 from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
@@ -36,73 +36,53 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 MONTHS = ["January","February","March","April","May","June",
           "July","August","September","October","November","December"]
 
-CODE_MAP = {
-    "medical":"Medical Amount","dental":"Dent Amount","vis":"Vis Amount",
-    "longtermd":"LongTermD Amount","shorttermd":"ShortTermD Amount","acc":"Acc Amount",
-    "id protect":None,"legal":None,"hosp ind":"HospIND Amount",
-    "critil":"CritIll Amount","critill":"CritIll Amount",
+# Broker "Benefit" value → Paycor amount column
+BENEFIT_CROSSWALK = {
+    "Medical":                         "Medical Amount",
+    "Dental":                          "Dent Amount",
+    "Vision":                          "Vis Amount",
+    "Accident":                        "Acc Amount",
+    "Critical Illness":                "CritIll Amount",
+    "Hospital Indemnity":              "HospIND Amount",
+    "Identity Protection":             "ID Protect Amount",
+    "Legal":                           "Legal Amount",
+    "Voluntary Life":                  "Life/AD&D Amount",
+    "Voluntary Long-Term Disability":  "LongTermD Amount",
+    "Voluntary Short-Term Disability": "ShortTermD Amount",
 }
 
-BUILTIN_CW = {
-    "Medical Plan Employee Per Pay Cost":                    "Medical Amount",
-    "Dental Plan Employee Per Pay Cost":                     "Dent Amount",
-    "Vision Plan Employee Per Pay Cost":                     "Vis Amount",
-    "Voluntary Long-Term Disability Employee Per Pay Cost":  "LongTermD Amount",
-    "Voluntary Short-Term Disability Employee Per Pay Cost": "ShortTermD Amount",
-    "Accident Plan Employee Per Pay Cost":                   "Acc Amount",
-    "Identity Protection Plan Employee Per Pay Cost":        None,
-    "Legal Plan Employee Per Pay Cost":                      None,
-    "Hospital Indemnity Plan Employee Per Pay Cost":         "HospIND Amount",
-    "Critical Illness":                                      "CritIll Amount",
+PAYCOR_BENEFIT_COLS = [
+    "Medical Amount","MedicalER2 Amount","Vis Amount","Dent Amount",
+    "Life/AD&D Amount","LongTermD Amount","ShortTermD Amount","CritIll Amount",
+    "Acc Amount","HospIND Amount","ID Protect Amount","Legal Amount",
+]
+# Employer-share columns: never part of employee-cost matching
+PAYCOR_EXCLUDED_COLS = {"MedicalER2 Amount"}
+
+# Broker division name → Paycor Client Name (both normalized lowercase)
+DIVISION_ALIASES = {
+    "lotus therapy": "lotus therapy partners llc",
 }
 
-BENEFIT_TO_OLD_BLOCK = {
-    "Medical":                         ("Medical Plan",                        "Medical - medical metlife"),
-    "Dental":                          ("Dental Plan",                         "Dental - dental metlife"),
-    "Vision":                          ("Vision Plan",                        "Vis - Vision metlife"),
-    "Voluntary Long-Term Disability":  ("Voluntary Long-Term Disability Plan", "LongTermD - LongTerm Disability Metlife"),
-    "Voluntary Short-Term Disability": ("Voluntary Short-Term Disability Plan","ShortTermD - Short Term Disability- Metlife"),
-    "Accident":                        ("Accident Plan",                      "Acc - Accident Metlife"),
-    "Identity Protection":             ("Identity Protection Plan",           "ID Protect - ID Protect met Life"),
-    "Legal":                           ("Legal Plan",                         "Legal - Legal Metlife"),
-    "Hospital Indemnity":              ("Hospital Indemnity Plan",            "Hosp IND - Hospital Indemnity Metlife"),
-    "Critical Illness":                ("Critical Illness",                   "CritIl - Critical Illness Metlife"),
-    "Voluntary Life":                  ("Voluntary Life Plan",                None),
-}
+def _money(v):
+    s = re.sub(r"[^0-9.\-]", "", str(v))
+    try:    return float(s)
+    except: return 0.0
 
-_LONG_FORMAT_ID_COLS = ["Social Security Number", "First Name", "Last Name", "Sex", "DOB",
-                        "Class", "Division", "Employment Status", "Hire Date",
-                        "Address 1", "Address 2", "City", "State", "Zip"]
+def _norm_name(s):
+    return re.sub(r"[^a-z]", "", str(s).lower())
 
-def _is_long_format_broker(df):
-    cols = {str(c).strip() for c in df.columns}
-    return {"Benefit", "EE Cost", "Plan"}.issubset(cols)
+def _norm_div(s, apply_alias=False):
+    d = re.sub(r"\s+", " ", str(s).strip().lower())
+    return DIVISION_ALIASES.get(d, d) if apply_alias else d
 
-def _convert_broker_long_to_wide(df):
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    id_col = "Social Security Number"
-    base = df.drop_duplicates(subset=[id_col], keep="first")[
-        [c for c in _LONG_FORMAT_ID_COLS if c in df.columns]
-    ].reset_index(drop=True)
-    wide = base.copy()
-    mapping_row = {}
-    for benefit_name, (old_prefix, cw_label) in BENEFIT_TO_OLD_BLOCK.items():
-        sub = df[df["Benefit"] == benefit_name]
-        if sub.empty:
-            continue
-        sub = sub.drop_duplicates(subset=[id_col], keep="first").set_index(id_col)
-        plan_col, cov_col, start_col, cost_col = (
-            old_prefix, f"{old_prefix} Coverage",
-            f"{old_prefix} Start Date", f"{old_prefix} Employee Per Pay Cost",
-        )
-        wide[plan_col]  = wide[id_col].map(sub["Plan"]) if "Plan" in sub.columns else None
-        wide[cov_col]   = wide[id_col].map(sub["Coverage Level"]) if "Coverage Level" in sub.columns else None
-        wide[start_col] = wide[id_col].map(sub["Coverage Start Date"]) if "Coverage Start Date" in sub.columns else None
-        wide[cost_col]  = wide[id_col].map(sub["EE Cost"]) if "EE Cost" in sub.columns else None
-        if cw_label:
-            mapping_row[plan_col] = cw_label
-    return wide, mapping_row
+def _split_paycor_full_name(full):
+    # Paycor Full Name is "Last, First Middle"
+    parts = str(full).split(",", 1)
+    last  = parts[0].strip()
+    rest  = parts[1].strip().split() if len(parts) > 1 else []
+    first = rest[0] if rest else ""
+    return first, last
 
 # ── DESIGN SYSTEM CSS ─────────────────────────────────────────────
 APP_CSS = """
@@ -695,78 +675,108 @@ def read_file(file):
 def parse_paycor(file):
     df = read_file(file)
     df.columns = [str(c).strip() for c in df.columns]
-    for col in df.columns:
-        if "Amount" in col or "amount" in col:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    return df
+    # Drop the export footer ("Count: N") and any row without a Client ID
+    cid = df.get("Client ID", pd.Series(dtype=str)).astype(str).str.strip()
+    df = df[(cid != "") & (cid.str.lower() != "nan")].reset_index(drop=True)
+    ben_cols = [c for c in PAYCOR_BENEFIT_COLS if c in df.columns]
+    for col in ben_cols:
+        df[col] = df[col].map(lambda v: _money(v) if str(v).strip() not in ("", "nan", "None") else None)
+    id_cols = [c for c in ["Client Name","Employee Number","Full Name","Status Type"] if c in df.columns]
+    long = df.melt(id_vars=id_cols, value_vars=ben_cols,
+                   var_name="Paycor Column", value_name="Paycor Amount").dropna(subset=["Paycor Amount"])
+    # Split checks: one line per employee per benefit
+    long = (long.groupby(["Client Name","Employee Number","Full Name","Paycor Column"], as_index=False)
+                .agg({"Paycor Amount":"sum","Status Type":"first"}))
+    return long
 
 def parse_broker_and_crosswalk(file):
-    raw = read_file(file)
-    raw.columns = [str(c).strip() for c in raw.columns]
-
-    if _is_long_format_broker(raw):
-        wide, mapping_row = _convert_broker_long_to_wide(raw)
-        cw = dict(BUILTIN_CW)
-        for col in wide.columns:
-            val = mapping_row.get(col, "")
-            if not val: continue
-            code = val.split(" - ")[0].strip().lower()
-            paycor_col = CODE_MAP.get(code)
-            for candidate in [
-                f"{col} Employee Per Pay Cost",
-                f"{col.replace(' Plan','')} Employee Per Pay Cost",
-                col,
-            ]:
-                if candidate in wide.columns and candidate not in cw:
-                    cw[candidate] = paycor_col; break
-        return wide.reset_index(drop=True), cw
-
-    # existing wide-format logic stays exactly as-is below this point
-    mapping_row = raw.iloc[0]
-    cw = dict(BUILTIN_CW)
-    for col in raw.columns:
-        val = str(mapping_row.get(col, "")).strip()
-        if not val or val.lower() == "nan": continue
-        code = val.split(" - ")[0].strip().lower()
-        paycor_col = CODE_MAP.get(code)
-        for candidate in [
-            f"{col} Employee Per Pay Cost",
-            f"{col.replace(' Plan','')} Employee Per Pay Cost",
-            col,
-        ]:
-            if candidate in raw.columns and candidate not in cw:
-                cw[candidate] = paycor_col; break
-    return raw.iloc[1:].reset_index(drop=True), cw
+    df = read_file(file)
+    df.columns = [str(c).strip() for c in df.columns]
+    for col in ("EE Cost", "ER Cost", "Benefit Amount"):
+        if col in df.columns:
+            df[col] = df[col].map(_money)
+    return df.reset_index(drop=True), dict(BENEFIT_CROSSWALK)
 
 # ── RECONCILIATION ENGINE ─────────────────────────────────────────
 def reconcile(broker_df, paycor_df, crosswalk, tolerance):
-    rows = []
+    rev_cw = {v: k for k, v in crosswalk.items()}
+    # One entry per Paycor person, plus their summed per-benefit amounts
+    people, amounts = {}, {}
+    for _, r in paycor_df.iterrows():
+        key = (str(r["Client Name"]), str(r["Employee Number"]))
+        if key not in people:
+            first, last = _split_paycor_full_name(r["Full Name"])
+            people[key] = {"nfirst": _norm_name(first), "nlast": _norm_name(last),
+                           "ndiv": _norm_div(r["Client Name"]),
+                           "first": first, "last": last,
+                           "loc": str(r["Client Name"]), "status": str(r.get("Status Type",""))}
+            amounts[key] = {}
+        amounts[key][r["Paycor Column"]] = float(r["Paycor Amount"])
+
+    def match_person(nfirst, nlast, ndiv):
+        """Returns (key, 'matched') | (None, 'unmatched') | (None, 'ambiguous')."""
+        cands = [k for k, p in people.items() if p["nlast"] == nlast and p["ndiv"] == ndiv]
+        pref  = [k for k in cands if nfirst and people[k]["nfirst"] and
+                 (people[k]["nfirst"].startswith(nfirst) or nfirst.startswith(people[k]["nfirst"]))]
+        if len(pref) == 1: return pref[0], "matched"
+        if len(pref) > 1:  return None, "ambiguous"
+        # Fallback: exact full-name match across all divisions, only if unique
+        exact = [k for k, p in people.items() if p["nlast"] == nlast and p["nfirst"] == nfirst and nfirst]
+        if len(exact) == 1: return exact[0], "matched"
+        if len(exact) > 1:  return None, "ambiguous"
+        return None, "unmatched"
+
+    rows, consumed = [], set()
+    match_cache = {}
     for _, emp in broker_df.iterrows():
         fn = str(emp.get("First Name","")).strip(); ln = str(emp.get("Last Name","")).strip()
         div = str(emp.get("Division","")).strip(); status = str(emp.get("Employment Status","")).strip()
         if not fn and not ln: continue
-        pmatch = paycor_df[
-            (paycor_df.get("First Name", pd.Series(dtype=str)).str.strip()==fn) &
-            (paycor_df.get("Last Name",  pd.Series(dtype=str)).str.strip()==ln)]
-        for broker_col, paycor_col in crosswalk.items():
-            bval = pd.to_numeric(emp.get(broker_col, 0), errors="coerce")
-            if pd.isna(bval) or bval == 0: continue
-            benefit = broker_col.replace(" Employee Per Pay Cost","").replace(" Plan","").strip()
-            pval=0.0; action=""; note=""
-            if paycor_col is None:
-                action="Review - Not in Paycor export"; note="No Paycor column mapped — verify manually"
-            elif len(pmatch)==0:
-                action="Review - Not in Paycor"; note="Employee not found in Paycor — possible new hire or name mismatch"
+        pkey = (_norm_name(fn), _norm_name(ln), _norm_div(div, apply_alias=True))
+        if pkey not in match_cache:
+            match_cache[pkey] = match_person(pkey[0], pkey[1], pkey[2])
+        key, mstatus = match_cache[pkey]
+
+        benefit = str(emp.get("Benefit","")).strip()
+        bval = float(emp.get("EE Cost", 0) or 0)
+        pcol = crosswalk.get(benefit)
+        pval = 0.0; action = ""; note = ""
+        if mstatus == "unmatched":
+            action = "Review - Not in Paycor"; note = "Employee not found in Paycor — possible new hire or name mismatch"
+        elif mstatus == "ambiguous":
+            action = "Review - Multiple matches"; note = "More than one Paycor employee matches this name — verify manually"
+        elif pcol is None:
+            action = "Review - Not in Paycor export"; note = "No Paycor column mapped — verify manually"
+        else:
+            consumed.add((key, pcol))
+            amt = amounts[key].get(pcol)
+            present = amt is not None and round(amt, 2) != 0
+            pval = float(amt) if present else 0.0
+            if not present and bval == 0:
+                action = "OK"; note = ""
+            elif not present:
+                action = "Add - Start deduction"; note = "Enrolled with broker but zero deduction in Paycor"
+            elif bval == 0:
+                action = "Review - Deduction vs $0 enrollment"; note = f"Paycor withholds ${pval:.2f} but broker shows $0.00 enrollment"
+            elif abs(round(bval - pval, 2)) <= tolerance:
+                action = "OK"; note = ""
             else:
-                pval=float(pmatch.iloc[0].get(paycor_col,0) or 0)
-                diff=round(bval-pval,2)
-                if abs(diff)<=tolerance: action="OK"; note=""
-                elif pval==0: action="Add - Start deduction"; note="Enrolled with broker but zero deduction in Paycor"
-                elif pval<0: action="Change - Negative in Paycor"; note=f"Paycor shows negative ${abs(pval):.2f} — possible credit/error"
-                else: action="Change - Amount differs"; note=f"Broker ${bval:.2f} vs Paycor ${pval:.2f} per pay"
-            rows.append({"Location":div,"First Name":fn,"Last Name":ln,"Status":status,
-                "Benefit":benefit,"Broker /pay":round(float(bval),2),"Paycor /pay":round(pval,2),
-                "Difference /pay":round(float(bval)-pval,2),"Action":action,"Note":note})
+                action = "Change - Amount differs"; note = f"Broker ${bval:.2f} vs Paycor ${pval:.2f} per pay"
+        rows.append({"Location":div,"First Name":fn,"Last Name":ln,"Status":status,
+            "Benefit":benefit,"Broker /pay":round(bval,2),"Paycor /pay":round(pval,2),
+            "Difference /pay":round(bval-pval,2),"Action":action,"Note":note})
+
+    # Paycor deductions with no broker enrollment line at all
+    for key, cols in amounts.items():
+        p = people[key]
+        for pcol, amt in cols.items():
+            if pcol in PAYCOR_EXCLUDED_COLS or (key, pcol) in consumed or round(amt, 2) == 0:
+                continue
+            benefit = rev_cw.get(pcol, pcol)
+            rows.append({"Location":p["loc"],"First Name":p["first"],"Last Name":p["last"],
+                "Status":p["status"],"Benefit":benefit,"Broker /pay":0.0,"Paycor /pay":round(amt,2),
+                "Difference /pay":round(-amt,2),"Action":"Review - Not in broker file",
+                "Note":f"Paycor withholds ${amt:.2f} but no broker enrollment line exists"})
     return pd.DataFrame(rows).reset_index(drop=True)
 
 # ── EXCEL BUILDER ─────────────────────────────────────────────────
@@ -845,7 +855,8 @@ def build_action_items_only(df, client_name="Client"):
     ws.row_dimensions[8].height=8; _dh(ws,DISPLAY_COLS,9); ws.column_dimensions["J"].width=40; _dr(ws,disc,10)
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf.getvalue()
 
-def build_excel(df, client_name="Client"):
+def build_excel(df, client_name="Client", period=""):
+    header_label = client_name.strip() or period or "Client"
     disc=df[df["Action"]!="OK"].reset_index(drop=True)
     ct={"OK":int((df["Action"]=="OK").sum()),"Add":int(df["Action"].str.startswith("Add").sum()),
         "Change":int(df["Action"].str.startswith("Change").sum()),"Review":int(df["Action"].str.startswith("Review").sum())}
@@ -867,7 +878,7 @@ def build_excel(df, client_name="Client"):
         if fmt: c.number_format=fmt
         if border: c.border=BORD
         return c
-    m("A1:H1"); p("A1",f"ProPayHR  |  {client_name} Benefits Reconciliation  |  {datetime.now().strftime('%B %d, %Y')}",font=Font(name=AR,size=14,bold=True,color=WHITE),fill=NAVY,align=Alignment(vertical="center",indent=1)); d.row_dimensions[1].height=28
+    m("A1:H1"); p("A1",f"ProPayHR  |  {header_label} Benefits Reconciliation  |  {period or datetime.now().strftime('%B %d, %Y')}",font=Font(name=AR,size=14,bold=True,color=WHITE),fill=NAVY,align=Alignment(vertical="center",indent=1)); d.row_dimensions[1].height=28
     m("A2:H2"); p("A2","Broker enrollment (per pay) vs Paycor deductions (per pay)  |  Direct per-pay comparison",font=Font(name=AR,size=9,italic=True,color="595959"))
     tiles=[("A","Lines compared",total,"0","DCE6F1"),("C","Matched (OK)",ct["OK"],"0","E2EFDA"),("E","Require action",ct["Add"]+ct["Change"],"0","FCE4D6"),("G","Monthly $ at stake",add_mo,"$#,##0.00","FFF2CC")]
     d.row_dimensions[4].height=16; d.row_dimensions[5].height=30
@@ -1122,7 +1133,7 @@ with right:
     period = f"{sel_month} {int(sel_year)}"
 
     tolerance = st.number_input("Acceptable Difference ($)", min_value=0.0, max_value=1.0,
-        value=0.05, step=0.01,
+        value=0.01, step=0.01,
         help="Two amounts this close to each other will be treated as a match.")
     st.markdown('<div style="font-size:0.78rem;color:#7D5A5E;line-height:1.55;margin-top:0.3rem;margin-bottom:0.6rem;">How close two dollar amounts need to be to count as a match. The default ($0.05) handles most rounding differences between systems.</div>', unsafe_allow_html=True)
 
@@ -1165,7 +1176,7 @@ if run:
             recon_df = reconcile(broker_df, paycor_df, crosswalk, tolerance)
             st.session_state.recon_df    = recon_df
             st.session_state.last_run_ts = datetime.now()
-            _excel_full    = build_excel(recon_df, client_name.strip())
+            _excel_full    = build_excel(recon_df, client_name.strip(), period=period)
             _excel_actions = build_action_items_only(recon_df, client_name.strip())
             save_to_history(recon_df, client_name.strip(), period, excel_bytes=_excel_full)
 
