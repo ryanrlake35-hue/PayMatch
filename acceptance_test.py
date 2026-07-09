@@ -35,7 +35,8 @@ ok_zero = ok[(ok["Broker /pay"] == 0)]
 unmatched = review[review["Action"] == "Review - Not in Paycor"]
 paycor_only = review[review["Action"] == "Review - Not in broker file"]
 ded_vs_zero = review[review["Action"] == "Review - Deduction vs $0 enrollment"]
-at_stake = round(add["Broker /pay"].sum() + change["Difference /pay"].abs().sum(), 2)
+at_stake = round(add["Broker /pay"].sum() + change["Difference /pay"].abs().sum()
+                 + review["Broker /pay"].sum(), 2)
 
 print(f"OK:      {len(ok)}  (amount matches: {len(ok)-len(ok_zero)}, zero-cost: {len(ok_zero)})   expected 1152 (1078 + 74)")
 print(f"Add:     {len(add)}   expected 1")
