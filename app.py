@@ -838,7 +838,8 @@ def build_action_items_only(df, client_name="Client"):
     disc=df[df["Action"]!="OK"].reset_index(drop=True)
     ct={"Add":int(df["Action"].str.startswith("Add").sum()),"Change":int(df["Action"].str.startswith("Change").sum()),"Review":int(df["Action"].str.startswith("Review").sum())}
     tdisc=ct["Add"]+ct["Change"]+ct["Review"]; n_emps=disc["First Name"].nunique()
-    add_mo=round(df[df["Action"].str.startswith("Add")]["Broker /pay"].sum()*26/12,2)
+    _nf=df[(df["Action"]=="Review - Not in Paycor")&(df["Broker /pay"]>0)]
+    add_mo=round((df[df["Action"].str.startswith("Add")]["Broker /pay"].sum()+_nf["Broker /pay"].sum())*26/12,2)
     wb=Workbook(); ws=wb.active; ws.title="Action Items"; ws.sheet_view.showGridLines=False
     _sw(ws,{1:18,2:10,3:26,4:46,5:12,6:12,7:11,8:28,9:40})
     _nh(ws,f"PayMatch  |  {client_name}  |  Action Items  |  {datetime.now().strftime('%B %d, %Y')}",9)
@@ -862,7 +863,9 @@ def build_excel(df, client_name="Client", period=""):
         "Change":int(df["Action"].str.startswith("Change").sum()),"Review":int(df["Action"].str.startswith("Review").sum())}
     total=len(df); tdisc=ct["Add"]+ct["Change"]+ct["Review"]
     adds=df[df["Action"].str.startswith("Add")]; chgs=df[df["Action"].str.startswith("Change")]
-    add_mo=round(adds["Broker /pay"].sum()*26/12,2); cdiff=round(chgs["Difference /pay"].abs().sum(),2)
+    nf=df[(df["Action"]=="Review - Not in Paycor")&(df["Broker /pay"]>0)]
+    add_pp=round(adds["Broker /pay"].sum(),2); notfound_pp=round(nf["Broker /pay"].sum(),2)
+    add_mo=round((add_pp+notfound_pp)*26/12,2); cdiff=round(chgs["Difference /pay"].abs().sum(),2)
     locs=df[df["Action"]!="OK"].groupby("Location").size().sort_values(ascending=False)
     n_emps=disc["First Name"].nunique(); wb=Workbook()
     d=wb.active; d.title="Dashboard"; d.sheet_view.showGridLines=False
@@ -880,7 +883,7 @@ def build_excel(df, client_name="Client", period=""):
         return c
     m("A1:H1"); p("A1",f"ProPayHR  |  {header_label} Benefits Reconciliation  |  {period or datetime.now().strftime('%B %d, %Y')}",font=Font(name=AR,size=14,bold=True,color=WHITE),fill=NAVY,align=Alignment(vertical="center",indent=1)); d.row_dimensions[1].height=28
     m("A2:H2"); p("A2","Broker enrollment (per pay) vs Paycor deductions (per pay)  |  Direct per-pay comparison",font=Font(name=AR,size=9,italic=True,color="595959"))
-    tiles=[("A","Lines compared",total,"0","DCE6F1"),("C","Matched (OK)",ct["OK"],"0","E2EFDA"),("E","Require action",ct["Add"]+ct["Change"],"0","FCE4D6"),("G","Monthly $ at stake",add_mo,"$#,##0.00","FFF2CC")]
+    tiles=[("A","Lines compared",total,"0","DCE6F1"),("C","Matched (OK)",ct["OK"],"0","E2EFDA"),("E","Require action",ct["Add"]+ct["Change"]+len(nf),"0","FCE4D6"),("G","Monthly $ at stake",add_mo,"$#,##0.00","FFF2CC")]
     d.row_dimensions[4].height=16; d.row_dimensions[5].height=30
     for col,lab,val,fmt,fill in tiles:
         c2=chr(ord(col)+1); m(f"{col}4:{c2}4"); p(f"{col}4",lab,font=Font(name=AR,size=10,color="404040"),fill=fill,align=Alignment(horizontal="center"))
@@ -909,12 +912,14 @@ def build_excel(df, client_name="Client", period=""):
     d.add_chart(bg,"E14")
     dr2=tr+2; m(f"A{dr2}:D{dr2}"); p(f"A{dr2}","Dollar impact",font=Font(name=AR,size=12,bold=True,color=NAVY),fill=SEC,align=Alignment(indent=1))
     m(f"A{dr2+1}:C{dr2+1}"); p(f"A{dr2+1}","Category",font=Font(name=AR,size=10,bold=True),fill="F2F2F2",border=True); p(f"D{dr2+1}","Per pay",font=Font(name=AR,size=10,bold=True),fill="F2F2F2",align=Alignment(horizontal="right"),border=True); p(f"E{dr2+1}","Per month",font=Font(name=AR,size=10,bold=True),fill="F2F2F2",align=Alignment(horizontal="right"),border=True)
-    drows=[("Add - deductions to start",round(adds["Broker /pay"].sum(),2)),("Change - corrections needed",cdiff)]
+    drows=[("Add - deductions missing (matched employees)",add_pp),
+           ("Review - enrolled, not found in payroll",notfound_pp),
+           ("Change - corrections needed",cdiff)]
     for i,(lab,amt) in enumerate(drows):
         r=dr2+2+i; m(f"A{r}:C{r}"); d[f"A{r}"].value=lab; d[f"A{r}"].font=Font(name=AR,size=10); d[f"A{r}"].border=BORD
         d[f"D{r}"].value=amt; d[f"D{r}"].font=Font(name=AR,size=10,bold=True); d[f"D{r}"].number_format="$#,##0.00"; d[f"D{r}"].alignment=Alignment(horizontal="right"); d[f"D{r}"].border=BORD
         d[f"E{r}"].value=round(amt*26/12,2); d[f"E{r}"].font=Font(name=AR,size=10,bold=True); d[f"E{r}"].number_format="$#,##0.00"; d[f"E{r}"].alignment=Alignment(horizontal="right"); d[f"E{r}"].border=BORD
-    ta=round(sum(x[1] for x in drows),2); r=dr2+4; m(f"A{r}:C{r}"); _nt(d,r,1,"TOTAL",4,ta,fmt="$#,##0.00",span=3)
+    ta=round(sum(x[1] for x in drows),2); r=dr2+2+len(drows); m(f"A{r}:C{r}"); _nt(d,r,1,"TOTAL",4,ta,fmt="$#,##0.00",span=3)
     d[f"E{r}"].value=round(ta*26/12,2); d[f"E{r}"].font=Font(name=AR,size=10,bold=True,color=WHITE); d[f"E{r}"].fill=PatternFill("solid",fgColor=TF); d[f"E{r}"].number_format="$#,##0.00"; d[f"E{r}"].alignment=Alignment(horizontal="right"); d[f"E{r}"].border=BORD
     d.page_setup.orientation="landscape"; d.page_setup.fitToWidth=1; d.page_setup.fitToHeight=0; d.sheet_properties.pageSetUpPr=PageSetupProperties(fitToPage=True)
     aw=wb.create_sheet("Action Items"); aw.sheet_view.showGridLines=False
