@@ -1108,7 +1108,7 @@ with left:
             Master Mapping Report
             <span class="file-tag">Broker</span>
         </div>
-        <div class="card-desc">Enrollment export from your broker. The second row should contain benefit labels — PayMatch reads them automatically. Accepted: .xlsx, .xls, .csv</div>
+        <div class="card-desc">Enrollment export from your broker — one row per person per benefit, with EE Cost per pay. PayMatch reads the benefit names automatically. Accepted: .xlsx, .xls, .csv</div>
     </div>
     """, unsafe_allow_html=True)
     broker_file = st.file_uploader("Master Mapping Report", type=["xlsx","xls","csv"],
@@ -1135,7 +1135,7 @@ with right:
     tolerance = st.number_input("Acceptable Difference ($)", min_value=0.0, max_value=1.0,
         value=0.01, step=0.01,
         help="Two amounts this close to each other will be treated as a match.")
-    st.markdown('<div style="font-size:0.78rem;color:#7D5A5E;line-height:1.55;margin-top:0.3rem;margin-bottom:0.6rem;">How close two dollar amounts need to be to count as a match. The default ($0.05) handles most rounding differences between systems.</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:0.78rem;color:#7D5A5E;line-height:1.55;margin-top:0.3rem;margin-bottom:0.6rem;">How close two dollar amounts need to be to count as a match. The default ($0.01) treats anything more than a penny apart as a discrepancy.</div>', unsafe_allow_html=True)
 
     st.markdown("""
     <div class="info-box">
@@ -1188,7 +1188,10 @@ if run:
                 n_add  = int(recon_df["Action"].str.startswith("Add").sum())
                 n_chg  = int(recon_df["Action"].str.startswith("Change").sum())
                 n_rev  = int(recon_df["Action"].str.startswith("Review").sum())
-                mo_var = round(recon_df[recon_df["Action"].str.startswith("Add")]["Broker /pay"].sum()*26/12, 2)
+                add_pp = round(recon_df[recon_df["Action"].str.startswith("Add")]["Broker /pay"].sum(), 2)
+                _nf = recon_df[(recon_df["Action"] == "Review - Not in Paycor") & (recon_df["Broker /pay"] > 0)]
+                notfound_pp = round(_nf["Broker /pay"].sum(), 2)
+                mo_var = round((add_pp + notfound_pp)*26/12, 2)
                 n_emps = recon_df[recon_df["Action"]!="OK"]["First Name"].nunique()
                 disc_ct = n_add + n_chg + n_rev
                 ts = st.session_state.last_run_ts.strftime("%-I:%M %p on %B %-d, %Y")
@@ -1240,7 +1243,7 @@ if run:
                         <div style="font-size:1.15rem;flex-shrink:0;margin-top:0.05rem;">&#9888;</div>
                         <div>
                             <div class="urgency-amount"><span class="pm-countup">${mo_var:,.2f}</span> / month not being collected</div>
-                            <div class="urgency-note">{n_add} employees are enrolled with the broker but have no deduction set up in Paycor. These need to be corrected immediately to avoid further financial exposure.</div>
+                            <div class="urgency-note">Deductions missing for matched employees: ${add_pp:,.2f} per pay &nbsp;·&nbsp; Enrolled employees not found in payroll: ${notfound_pp:,.2f} per pay. These need to be corrected immediately to avoid further financial exposure.</div>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
