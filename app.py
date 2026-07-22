@@ -2,7 +2,7 @@
 PayMatch by ProPayHR — Benefits Reconciliation Platform
 """
 import base64, io, re, warnings, os, threading, time
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
 from pydantic import BaseModel, field_validator
@@ -58,6 +58,15 @@ PAYCOR_BENEFIT_COLS = [
 ]
 # Employer-share columns: never part of employee-cost matching
 PAYCOR_EXCLUDED_COLS = {"MedicalER2 Amount"}
+
+# Benefit eligibility: first of the month following this many calendar
+# days after hire date
+ELIGIBILITY_WAITING_DAYS = 60
+
+# Actions produced by run_audit_checks (employee-level Paycor audits)
+AUDIT_ACTIONS = ("Review - Casual with coverage",
+                 "Review - Part-time with medical",
+                 "Review - Before eligibility date")
 
 # Broker division name → Paycor Client Name (both normalized lowercase)
 DIVISION_ALIASES = {
@@ -697,6 +706,73 @@ def parse_broker_and_crosswalk(file):
             df[col] = df[col].map(_money)
     return df.reset_index(drop=True), dict(BENEFIT_CROSSWALK)
 
+# ── PAYCOR AUDIT CHECKS ───────────────────────────────────────────
+def compute_eligibility_date(hire_date):
+    """First of the month following ELIGIBILITY_WAITING_DAYS calendar days
+    after hire; if the waiting period ends exactly on the 1st, that day."""
+    d = hire_date + timedelta(days=ELIGIBILITY_WAITING_DAYS)
+    if d.day == 1:
+        return d
+    return date(d.year + (1 if d.month == 12 else 0), 1 if d.month == 12 else d.month + 1, 1)
+
+def run_audit_checks(raw_df, recon_month_start):
+    """Employee-level audits on the raw Paycor export (needs Worker Type,
+    Status Type, Hire Date — columns the reconcile melt drops). Returns
+    rows in DISPLAY_COLS format; empty if required columns are missing."""
+    df = raw_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    cid = df.get("Client ID", pd.Series(dtype=str)).astype(str).str.strip()
+    df = df[(cid != "") & (cid.str.lower() != "nan")].reset_index(drop=True)
+    ben_cols = [c for c in PAYCOR_BENEFIT_COLS if c in df.columns]
+    if not ben_cols or "Full Name" not in df.columns or "Client Name" not in df.columns:
+        return pd.DataFrame(columns=DISPLAY_COLS)
+    for col in ben_cols:
+        df[col] = df[col].map(lambda v: _money(v) if str(v).strip() not in ("", "nan", "None") else 0.0)
+
+    def _first_filled(s):
+        for v in s:
+            v = str(v).strip()
+            if v and v.lower() != "nan":
+                return v
+        return ""
+    agg = {c: "sum" for c in ben_cols}
+    for c in ("Full Name", "Status Type", "Worker Type", "Hire Date"):
+        if c not in df.columns:
+            df[c] = ""
+        agg[c] = _first_filled
+    g = df.groupby(["Client Name", "Employee Number"], as_index=False).agg(agg)
+
+    if isinstance(recon_month_start, datetime):
+        recon_month_start = recon_month_start.date()
+    rows = []
+    for _, r in g.iterrows():
+        ded = {c: round(float(r[c]), 2) for c in ben_cols if float(r[c]) > 0}
+        if not ded:
+            continue
+        first, last = _split_paycor_full_name(r["Full Name"])
+        base = {"Location": str(r["Client Name"]), "First Name": first, "Last Name": last,
+                "Status": str(r["Status Type"]).strip(),
+                "Broker /pay": 0.0, "Difference /pay": 0.0}
+        ded_list = ", ".join(f"{c.replace(' Amount', '')} ${v:.2f}" for c, v in ded.items())
+        total = round(sum(ded.values()), 2)
+        if str(r["Worker Type"]).strip().lower() == "casual":
+            rows.append({**base, "Benefit": "All benefits", "Paycor /pay": total,
+                "Action": "Review - Casual with coverage",
+                "Note": f"Casual worker has deductions: {ded_list} — casual employees are not benefit-eligible"})
+        med = ded.get("Medical Amount", 0.0)
+        if str(r["Status Type"]).strip().lower() == "part time" and med > 0:
+            rows.append({**base, "Benefit": "Medical", "Paycor /pay": med,
+                "Action": "Review - Part-time with medical",
+                "Note": f"Part-time employee has a medical deduction of ${med:.2f} — part-time employees may keep all benefits except medical"})
+        hire = pd.to_datetime(str(r["Hire Date"]).strip(), errors="coerce")
+        if pd.notna(hire):
+            elig = compute_eligibility_date(hire.date())
+            if recon_month_start < elig:
+                rows.append({**base, "Benefit": "All benefits", "Paycor /pay": total,
+                    "Action": "Review - Before eligibility date",
+                    "Note": f"Hired {hire.strftime('%m/%d/%Y')}; benefit-eligible {elig.strftime('%m/%d/%Y')} — deductions active before eligibility date"})
+    return pd.DataFrame(rows, columns=DISPLAY_COLS)
+
 # ── RECONCILIATION ENGINE ─────────────────────────────────────────
 def reconcile(broker_df, paycor_df, crosswalk, tolerance):
     rev_cw = {v: k for k, v in crosswalk.items()}
@@ -838,6 +914,7 @@ def build_action_items_only(df, client_name="Client"):
     disc=df[df["Action"]!="OK"].reset_index(drop=True)
     ct={"Add":int(df["Action"].str.startswith("Add").sum()),"Change":int(df["Action"].str.startswith("Change").sum()),"Review":int(df["Action"].str.startswith("Review").sum())}
     tdisc=ct["Add"]+ct["Change"]+ct["Review"]; n_emps=disc["First Name"].nunique()
+    audit_ct=int(df["Action"].isin(AUDIT_ACTIONS).sum())
     _nf=df[(df["Action"]=="Review - Not in Paycor")&(df["Broker /pay"]>0)]
     add_mo=round((df[df["Action"].str.startswith("Add")]["Broker /pay"].sum()+_nf["Broker /pay"].sum())*26/12,2)
     wb=Workbook(); ws=wb.active; ws.title="Action Items"; ws.sheet_view.showGridLines=False
@@ -850,10 +927,11 @@ def build_action_items_only(df, client_name="Client"):
     _kh(ws,[("Color / Action",1,1),("Count",2,2),("What it means",3,5),("What to do",6,9)],r=3)
     aik=[("DDEBF7","Blue  -  Add",ct["Add"],"Enrolled with broker but zero deduction in Paycor.","Set up the deduction in Paycor immediately."),
          ("FCE4D6","Pink  -  Change",ct["Change"],"Both sides have the benefit but dollar amounts differ.","Update the deduction amount in Paycor to match the broker."),
-         ("FFF2CC","Yellow  -  Review",ct["Review"],"Benefit not in Paycor export, or employee name did not match.","Verify manually in Paycor.")]
+         ("FFF2CC","Yellow  -  Review",ct["Review"]-audit_ct,"Benefit not in Paycor export, or employee name did not match.","Verify manually in Paycor."),
+         ("FFF2CC","Yellow  -  Review (Audit)",audit_ct,"Eligibility audit: casual with coverage, part-time with medical, or deductions before the eligibility date.","Verify eligibility in Paycor and stop any ineligible deductions.")]
     for ri,(fc,lb,cnt,mn,ac) in enumerate(aik,4): _kr(ws,ri,fc,lb,cnt,mn,ac,5,6,9)
-    _kt(ws,7,"TOTAL ACTION ITEMS",tdisc,f"{ct['Add']} Add  +  {ct['Change']} Change  +  {ct['Review']} Review  =  {tdisc} lines",f"{n_emps} employees need attention",3,5,6,9)
-    ws.row_dimensions[8].height=8; _dh(ws,DISPLAY_COLS,9); ws.column_dimensions["J"].width=40; _dr(ws,disc,10)
+    _kt(ws,8,"TOTAL ACTION ITEMS",tdisc,f"{ct['Add']} Add  +  {ct['Change']} Change  +  {ct['Review']} Review  =  {tdisc} lines",f"{n_emps} employees need attention",3,5,6,9)
+    ws.row_dimensions[9].height=8; _dh(ws,DISPLAY_COLS,10); ws.column_dimensions["J"].width=40; _dr(ws,disc,11)
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf.getvalue()
 
 def build_excel(df, client_name="Client", period=""):
@@ -862,6 +940,7 @@ def build_excel(df, client_name="Client", period=""):
     ct={"OK":int((df["Action"]=="OK").sum()),"Add":int(df["Action"].str.startswith("Add").sum()),
         "Change":int(df["Action"].str.startswith("Change").sum()),"Review":int(df["Action"].str.startswith("Review").sum())}
     total=len(df); tdisc=ct["Add"]+ct["Change"]+ct["Review"]
+    audit_ct=int(df["Action"].isin(AUDIT_ACTIONS).sum())
     adds=df[df["Action"].str.startswith("Add")]; chgs=df[df["Action"].str.startswith("Change")]
     nf=df[(df["Action"]=="Review - Not in Paycor")&(df["Broker /pay"]>0)]
     add_pp=round(adds["Broker /pay"].sum(),2); notfound_pp=round(nf["Broker /pay"].sum(),2)
@@ -928,10 +1007,11 @@ def build_excel(df, client_name="Client", period=""):
     _kh(aw,[("Color / Action",1,1),("Count",2,2),("What it means",3,5),("What to do",6,9)])
     aik=[("DDEBF7","Blue  -  Add",ct["Add"],"Enrolled with broker but zero deduction in Paycor. Company may be eating this cost.","Set up the deduction in Paycor immediately."),
          ("FCE4D6","Pink  -  Change",ct["Change"],"Both sides have the benefit but dollar amounts differ.","Update the deduction amount in Paycor to match the broker."),
-         ("FFF2CC","Yellow  -  Review",ct["Review"],"Benefit not in Paycor export, or employee name did not match.","Verify manually in Paycor.")]
+         ("FFF2CC","Yellow  -  Review",ct["Review"]-audit_ct,"Benefit not in Paycor export, or employee name did not match.","Verify manually in Paycor."),
+         ("FFF2CC","Yellow  -  Review (Audit)",audit_ct,"Eligibility audit: casual with coverage, part-time with medical, or deductions before the eligibility date.","Verify eligibility in Paycor and stop any ineligible deductions.")]
     for ri,(fc,lb,cnt,mn,ac) in enumerate(aik,3): _kr(aw,ri,fc,lb,cnt,mn,ac,5,6,9)
-    _kt(aw,6,"TOTAL ACTION ITEMS",tdisc,f"{ct['Add']} Add  +  {ct['Change']} Change  +  {ct['Review']} Review  =  {tdisc} lines",f"{n_emps} employees need attention",3,5,6,9)
-    aw.row_dimensions[7].height=8; _dh(aw,DISPLAY_COLS,8); _dr(aw,disc,9); aw.column_dimensions["J"].width=40
+    _kt(aw,7,"TOTAL ACTION ITEMS",tdisc,f"{ct['Add']} Add  +  {ct['Change']} Change  +  {ct['Review']} Review  =  {tdisc} lines",f"{n_emps} employees need attention",3,5,6,9)
+    aw.row_dimensions[8].height=8; _dh(aw,DISPLAY_COLS,9); _dr(aw,disc,10); aw.column_dimensions["J"].width=40
     allw=wb.create_sheet("All Lines"); allw.sheet_view.showGridLines=False
     _sw(allw,{1:18,2:13,3:13,4:11,5:28,6:12,7:12,8:11,9:26,10:40})
     _nh(allw,"ALL RECONCILIATION LINES  |  Color Key & Summary",10)
@@ -939,10 +1019,11 @@ def build_excel(df, client_name="Client", period=""):
     allk=[("E2EFDA","Green  -  OK",ct["OK"],"Broker and Paycor match perfectly.","No action needed."),
           ("DDEBF7","Blue  -  Add",ct["Add"],"Enrolled with broker but zero deduction in Paycor.","Set up the deduction in Paycor immediately."),
           ("FCE4D6","Pink  -  Change",ct["Change"],"Both sides have the benefit but dollar amounts differ.","Update the deduction amount in Paycor to match the broker."),
-          ("FFF2CC","Yellow  -  Review",ct["Review"],"Benefit not in export or name not matched.","Verify manually in Paycor.")]
+          ("FFF2CC","Yellow  -  Review",ct["Review"]-audit_ct,"Benefit not in export or name not matched.","Verify manually in Paycor."),
+          ("FFF2CC","Yellow  -  Review (Audit)",audit_ct,"Casual with coverage, part-time with medical, or before eligibility date.","Verify eligibility in Paycor and stop any ineligible deductions.")]
     for ri,(fc,lb,cnt,mn,ac) in enumerate(allk,3): _kr(allw,ri,fc,lb,cnt,mn,ac,6,7,10)
-    _kt(allw,7,"TOTAL LINES",total,f"{ct['OK']} OK  +  {ct['Add']} Add  +  {ct['Change']} Change  +  {ct['Review']} Review  =  {total}",f"{tdisc} lines need attention  |  {n_emps} employees affected",3,6,7,10)
-    allw.row_dimensions[8].height=8; _dh(allw,DISPLAY_COLS,9); _dr(allw,df,10)
+    _kt(allw,8,"TOTAL LINES",total,f"{ct['OK']} OK  +  {ct['Add']} Add  +  {ct['Change']} Change  +  {ct['Review']} Review  =  {total}",f"{tdisc} lines need attention  |  {n_emps} employees affected",3,6,7,10)
+    allw.row_dimensions[9].height=8; _dh(allw,DISPLAY_COLS,10); _dr(allw,df,11)
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf.getvalue()
 
 # ── HISTORY (Supabase) ────────────────────────────────────────────
@@ -1179,6 +1260,11 @@ if run:
                 st.error(f"The Master Mapping Report ({broker_file.name}) appears to be empty or couldn't be read. Make sure the file has benefit labels in the second row and employee data below that.")
                 st.stop()
             recon_df = reconcile(broker_df, paycor_df, crosswalk, tolerance)
+            paycor_file.seek(0)
+            audit_df = run_audit_checks(read_file(paycor_file),
+                                        date(int(sel_year), MONTHS.index(sel_month) + 1, 1))
+            if len(audit_df):
+                recon_df = pd.concat([recon_df, audit_df], ignore_index=True)
             st.session_state.recon_df    = recon_df
             st.session_state.last_run_ts = datetime.now()
             _excel_full    = build_excel(recon_df, client_name.strip(), period=period)
