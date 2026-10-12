@@ -1,7 +1,7 @@
 """
 PayMatch by ProPayHR — Benefits Reconciliation Platform
 """
-import base64, io, re, warnings, os, threading, time
+import base64, hashlib, io, re, warnings, os, threading, time
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
@@ -682,9 +682,92 @@ def read_file(file):
     elif n.endswith(".xls"): return pd.read_excel(file, dtype=str, engine="xlrd")
     else:                    return pd.read_excel(file, dtype=str)
 
-def parse_paycor(file):
-    df = read_file(file)
+# ── DEDUCTION REPORT LAYOUTS ──────────────────────────────────────
+# PayMatch's matching logic is built on the "wide" Paycor layout: one row
+# per employee, one "<Code> Amount" column per benefit, for each client's
+# most recent payroll. The alternate Paycor report ("long" layout) has one
+# row per deduction per check for the whole month. normalize_deduction_report
+# converts the long layout into the wide one so nothing downstream changes.
+LONG_LAYOUT_COLS = ["Client Name", "SSN", "First Name", "Last Name", "Status Type",
+                    "Hire Date", "Dist. Deduction Code", "Deduction Current Amount",
+                    "Employee Type", "Check Date"]
+WIDE_REQUIRED_COLS = ["Client ID", "Client Name", "Full Name", "Employee Number"]
+# A check date counts as a client's regular payroll when it covers at least
+# this share of the client's largest check run (filters out off-cycle checks).
+REGULAR_RUN_SHARE = 0.5
+
+def _is_long_layout(df):
+    return "Dist. Deduction Code" in df.columns and "Deduction Current Amount" in df.columns
+
+def normalize_deduction_report(df):
+    """Return the deduction report in the wide layout PayMatch expects.
+    Wide-layout files pass through unchanged. Long-layout files are reduced
+    to each client's latest regular check, split checks are summed, and
+    benefit codes become "<Code> Amount" columns. SSNs are replaced with a
+    one-way hash and dropped. Raises ValueError naming any missing columns."""
+    df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
+    if not _is_long_layout(df):
+        missing = [c for c in WIDE_REQUIRED_COLS if c not in df.columns]
+        if missing or not any(c in df.columns for c in PAYCOR_BENEFIT_COLS):
+            raise ValueError("Deduction Report layout not recognized. Missing column(s): "
+                             + ", ".join(missing or ["any benefit '... Amount' column"]))
+        df.attrs["layout"] = "wide"
+        return df
+
+    missing = [c for c in LONG_LAYOUT_COLS if c not in df.columns]
+    if missing:
+        raise ValueError("Deduction Report layout not recognized. Missing column(s): " + ", ".join(missing))
+
+    for c in ("Client Name", "SSN", "First Name", "Last Name", "Dist. Deduction Code"):
+        df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
+    df = df[df["Client Name"] != ""]
+    # Internal person key: hash of SSN, so the raw SSN never leaves this function
+    df["Employee Number"] = df["SSN"].map(lambda s: hashlib.sha256(s.encode()).hexdigest()[:12])
+    df = df.drop(columns=["SSN"])
+    df["_cd"] = pd.to_datetime(df["Check Date"], errors="coerce")
+
+    # Latest regular check date per client (skips small off-cycle runs)
+    runs = (df.dropna(subset=["_cd"]).groupby(["Client Name", "_cd"])["Employee Number"]
+              .nunique().reset_index(name="n"))
+    runs = runs[runs["n"] >= runs.groupby("Client Name")["n"].transform("max") * REGULAR_RUN_SHARE]
+    latest = runs.groupby("Client Name")["_cd"].max()
+    df = df[df["_cd"] == df["Client Name"].map(latest)]
+
+    # Employee attributes (first non-blank value per person)
+    def _first_filled(s):
+        for v in s:
+            v = str(v).strip()
+            if v and v.lower() not in ("nan", "none"):
+                return v
+        return ""
+    people = (df.groupby(["Client Name", "Employee Number"], as_index=False)
+                .agg({"First Name": _first_filled, "Last Name": _first_filled,
+                      "Status Type": _first_filled, "Employee Type": _first_filled,
+                      "Hire Date": _first_filled, "Check Date": _first_filled}))
+
+    # Benefit deductions only: code + " Amount" must be a column PayMatch knows
+    df["_col"] = df["Dist. Deduction Code"] + " Amount"
+    ded = df[df["_col"].isin(PAYCOR_BENEFIT_COLS)].copy()
+    ded["_amt"] = ded["Deduction Current Amount"].map(_money)
+    wide = ded.pivot_table(index=["Client Name", "Employee Number"], columns="_col",
+                           values="_amt", aggfunc="sum").reset_index()
+    wide.columns.name = None
+
+    out = wide.merge(people, on=["Client Name", "Employee Number"], how="left")
+    out["Full Name"] = out["Last Name"] + ", " + out["First Name"]
+    out = out.rename(columns={"Employee Type": "Worker Type"}).drop(columns=["First Name", "Last Name"])
+    out["Client ID"] = out["Client Name"]
+    for c in PAYCOR_BENEFIT_COLS:
+        if c in out.columns:
+            out[c] = out[c].map(lambda v: "" if pd.isna(v) else f"{v:.2f}")
+    out = out.astype(str)
+    out.attrs["layout"] = "long"
+    out.attrs["check_dates"] = {k: v.strftime("%m/%d/%Y") for k, v in latest.items()}
+    return out
+
+def parse_paycor(file):
+    df = normalize_deduction_report(read_file(file))
     # Drop the export footer ("Count: N") and any row without a Client ID
     cid = df.get("Client ID", pd.Series(dtype=str)).astype(str).str.strip()
     df = df[(cid != "") & (cid.str.lower() != "nan")].reset_index(drop=True)
@@ -700,6 +783,7 @@ def parse_paycor(file):
         if c in long.columns: agg[c] = "first"
     long = (long.groupby(["Client Name","Employee Number","Full Name","Paycor Column"], as_index=False)
                 .agg(agg))
+    long.attrs = dict(df.attrs)
     return long
 
 def parse_broker_and_crosswalk(file):
@@ -723,8 +807,7 @@ def run_audit_checks(raw_df, recon_month_start):
     """Employee-level audits on the raw Paycor export (needs Worker Type,
     Status Type, Hire Date — columns the reconcile melt drops). Returns
     rows in DISPLAY_COLS format; empty if required columns are missing."""
-    df = raw_df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    df = normalize_deduction_report(raw_df)
     cid = df.get("Client ID", pd.Series(dtype=str)).astype(str).str.strip()
     df = df[(cid != "") & (cid.str.lower() != "nan")].reset_index(drop=True)
     ben_cols = [c for c in PAYCOR_BENEFIT_COLS if c in df.columns]
@@ -1297,6 +1380,10 @@ if run:
             if len(broker_df) == 0:
                 st.error(f"The Master Mapping Report ({broker_file.name}) appears to be empty or couldn't be read. Make sure the file has benefit labels in the second row and employee data below that.")
                 st.stop()
+            _cds = paycor_df.attrs.get("check_dates")
+            if _cds:
+                st.info("Deduction detail report detected. Using each location's latest regular payroll: "
+                        + "; ".join(f"{k} {v}" for k, v in sorted(_cds.items())))
             recon_df = reconcile(broker_df, paycor_df, crosswalk, tolerance)
             recon_df = flag_status_conflicts(recon_df)
             paycor_file.seek(0)
@@ -1431,6 +1518,8 @@ if run:
                 st.error("Couldn't read one of the files — it may be password-protected or have an unexpected layout. Try exporting a fresh copy from Paycor or your broker.")
             elif "codec" in err_str or "decode" in err_str or "encoding" in err_str:
                 st.error("One of the files couldn't be opened correctly. If it's a CSV, try opening it in Excel and saving again before uploading.")
+            elif "layout not recognized" in err_str:
+                st.error(f"{e}. PayMatch accepts the standard Paycor deduction export (one row per employee) or the Paycor deduction detail report (one row per deduction).")
             elif "column" in err_str or "key" in err_str:
                 st.error("A required column couldn't be found. Make sure the Deduction Report is a standard Paycor export and the enrollment file has employee names in columns labeled 'First Name' and 'Last Name'.")
             else:
