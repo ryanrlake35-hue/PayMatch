@@ -1,7 +1,7 @@
 """
 PayMatch by ProPayHR — Benefits Reconciliation Platform
 """
-import base64, hashlib, io, re, warnings, os, threading, time
+import base64, hashlib, html, io, re, warnings, os, threading, time
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
@@ -704,7 +704,7 @@ def normalize_deduction_report(df):
     Wide-layout files pass through unchanged. Long-layout files are reduced
     to each client's latest regular check, split checks are summed, and
     benefit codes become "<Code> Amount" columns. SSNs are replaced with a
-    one-way hash and dropped. Raises ValueError naming any missing columns."""
+    salted one-way hash and dropped. Raises ValueError naming any missing columns."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     if not _is_long_layout(df):
@@ -723,7 +723,8 @@ def normalize_deduction_report(df):
         df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
     df = df[df["Client Name"] != ""]
     # Internal person key: hash of SSN, so the raw SSN never leaves this function
-    df["Employee Number"] = df["SSN"].map(lambda s: hashlib.sha256(s.encode()).hexdigest()[:12])
+    salt = os.urandom(16)
+    df["Employee Number"] = df["SSN"].map(lambda s: hashlib.sha256(salt + s.encode()).hexdigest()[:16])
     df = df.drop(columns=["SSN"])
     df["_cd"] = pd.to_datetime(df["Check Date"], errors="coerce")
 
@@ -1421,7 +1422,7 @@ if run:
                     st.markdown(f"""
                     <div class="res-bar">
                         <div>
-                            <div class="res-bar-ttl">Reconciliation Complete &nbsp;·&nbsp; {client_name.strip()} &nbsp;·&nbsp; {period}</div>
+                            <div class="res-bar-ttl">Reconciliation Complete &nbsp;·&nbsp; {html.escape(client_name.strip())} &nbsp;·&nbsp; {period}</div>
                             <div class="res-bar-sub">{total:,} lines compared &nbsp;·&nbsp; {n_emps} employees with discrepancies</div>
                             <div class="run-ts">&#9201; Ran at {ts}</div>
                         </div>
@@ -1528,22 +1529,25 @@ if run:
 
 # ── TREND VIEW (per-client, shown when a client name is entered) ──
 if client_name.strip():
+    _cn_html = html.escape(client_name.strip())
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     history_df = load_history(client_name.strip())
 
     if len(history_df) > 1:
         st.markdown('<div class="trend-card">', unsafe_allow_html=True)
         st.markdown('<div class="slabel">Month-over-Month Trend</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="sdesc">How discrepancies and uncollected dollars have changed across reconciliation runs for <strong>{client_name.strip()}</strong>.</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sdesc">How discrepancies and uncollected dollars have changed across reconciliation runs for <strong>{_cn_html}</strong>.</div>', unsafe_allow_html=True)
 
+        history_df["_pord"] = pd.to_datetime(history_df["Period"], format="%B %Y", errors="coerce")
+        history_df = history_df.sort_values("_pord")
         t1, t2 = st.columns(2)
         with t1:
             st.markdown("**Discrepancies by month**")
-            chart_data = history_df.sort_values("Period").set_index("Period")[["Add","Change","Review"]]
+            chart_data = history_df.set_index("_pord")[["Add","Change","Review"]]
             st.bar_chart(chart_data, color=["#8B1A2F","#C9A227","#B23A22"])
         with t2:
             st.markdown("**Monthly $ at stake**")
-            mo_data = history_df.sort_values("Period").set_index("Period")[["Monthly $ at stake"]]
+            mo_data = history_df.set_index("_pord")[["Monthly $ at stake"]]
             st.line_chart(mo_data, color=["#8B1A2F"])
 
         st.markdown("**Run history**")
@@ -1552,7 +1556,7 @@ if client_name.strip():
         st.dataframe(dh, use_container_width=True, hide_index=True)
 
         if len(history_df) >= 2:
-            latest = history_df.iloc[0]; prev = history_df.iloc[1]
+            latest = history_df.iloc[-1]; prev = history_df.iloc[-2]
             dc = int(latest["Discrepancies"]) - int(prev["Discrepancies"])
             mc = round(float(latest["Monthly $ at stake"]) - float(prev["Monthly $ at stake"]), 2)
             cls = "delta-dn" if dc < 0 else "delta-up"
@@ -1565,14 +1569,14 @@ if client_name.strip():
         st.markdown('</div>', unsafe_allow_html=True)
 
     elif len(history_df) == 1:
-        st.markdown(f'<div style="background:var(--paper,white);border-radius:12px;padding:1rem 1.5rem;border:1px solid #E3E0D8;color:#9D8E88;font-size:0.84rem;margin-top:0.5rem;">Trend view will appear after your second reconciliation run for <strong style="color:#5C544E">{client_name.strip()}</strong>.</div>', unsafe_allow_html=True)
+        st.markdown(f'<div style="background:var(--paper,white);border-radius:12px;padding:1rem 1.5rem;border:1px solid #E3E0D8;color:#9D8E88;font-size:0.84rem;margin-top:0.5rem;">Trend view will appear after your second reconciliation run for <strong style="color:#5C544E">{_cn_html}</strong>.</div>', unsafe_allow_html=True)
 
     # ── NOTES ─────────────────────────────────────────────────────
     if len(history_df) > 0:
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
         st.markdown('<div class="notes-wrap">', unsafe_allow_html=True)
         st.markdown('<div class="notes-label">Run Notes</div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="font-size:0.82rem;color:#7D5A5E;margin-bottom:0.8rem;">Notes for <strong style="color:#2A0E14;">{client_name.strip()}</strong> &nbsp;·&nbsp; {period}. Saved automatically with this run.</div>', unsafe_allow_html=True)
+        st.markdown(f'<div style="font-size:0.82rem;color:#7D5A5E;margin-bottom:0.8rem;">Notes for <strong style="color:#2A0E14;">{_cn_html}</strong> &nbsp;·&nbsp; {period}. Saved automatically with this run.</div>', unsafe_allow_html=True)
         _nk = f"rn_{''.join(c if c.isalnum() else '_' for c in client_name.strip())}_{period.replace(' ','_')}"
         if _nk not in st.session_state:
             st.session_state[_nk] = get_run_notes(client_name.strip(), period)
