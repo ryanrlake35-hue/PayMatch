@@ -1,7 +1,7 @@
 """
 PayMatch by ProPayHR — Benefits Reconciliation Platform
 """
-import base64, hashlib, html, io, re, warnings, os, threading, time
+import base64, hashlib, html, io, re, warnings, os
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client as SupabaseClient
@@ -762,13 +762,18 @@ def normalize_deduction_report(df):
     for c in PAYCOR_BENEFIT_COLS:
         if c in out.columns:
             out[c] = out[c].map(lambda v: "" if pd.isna(v) else f"{v:.2f}")
-    out = out.astype(str)
+    out = out.astype(str).sort_values(["Client Name", "Full Name", "Employee Number"]).reset_index(drop=True)
+    # Replace the salted hash with a plain sequence number (stable order, nothing SSN-derived kept)
+    out["Employee Number"] = [f"L{i:05d}" for i in range(1, len(out) + 1)]
     out.attrs["layout"] = "long"
     out.attrs["check_dates"] = {k: v.strftime("%m/%d/%Y") for k, v in latest.items()}
     return out
 
 def parse_paycor(file):
-    df = normalize_deduction_report(read_file(file))
+    return parse_paycor_df(read_file(file))
+
+def parse_paycor_df(raw_df):
+    df = normalize_deduction_report(raw_df)
     # Drop the export footer ("Count: N") and any row without a Client ID
     cid = df.get("Client ID", pd.Series(dtype=str)).astype(str).str.strip()
     df = df[(cid != "") & (cid.str.lower() != "nan")].reset_index(drop=True)
@@ -794,6 +799,18 @@ def parse_broker_and_crosswalk(file):
         if col in df.columns:
             df[col] = df[col].map(_money)
     return df.reset_index(drop=True), dict(BENEFIT_CROSSWALK)
+
+def report_check_month(raw_df):
+    """Most common check-date month in the Paycor report, as 'Month YYYY'
+    (e.g. 'September 2026'); '' if the report has no readable Check Date."""
+    cols = {str(c).strip(): c for c in raw_df.columns}
+    if "Check Date" not in cols:
+        return ""
+    d = pd.to_datetime(raw_df[cols["Check Date"]], errors="coerce").dropna()
+    if d.empty:
+        return ""
+    m = d.dt.to_period("M").mode().iloc[0]
+    return f"{MONTHS[m.month - 1]} {m.year}"
 
 # ── PAYCOR AUDIT CHECKS ───────────────────────────────────────────
 def compute_eligibility_date(hire_date):
@@ -1156,14 +1173,19 @@ def save_to_history(recon_df, client_name, period, excel_bytes=None):
         "Change": int(recon_df["Action"].str.startswith("Change").sum()),
         "Review": int(recon_df["Action"].str.startswith("Review").sum()),
     }
-    mo = round(recon_df[recon_df["Action"].str.startswith("Add")]["Broker /pay"].sum() * 26 / 12, 2)
+    _nf = recon_df[(recon_df["Action"] == "Review - Not in Paycor") & (recon_df["Broker /pay"] > 0)]
+    mo = round((recon_df[recon_df["Action"].str.startswith("Add")]["Broker /pay"].sum()
+                + _nf["Broker /pay"].sum()) * 26 / 12, 2)
     report_file = ""
     if excel_bytes:
-        safe = client_name.strip().replace(" ", "_").replace("/", "_")
-        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_file = os.path.join(REPORTS_DIR, f"PayMatch_{safe}_{period.replace(' ','_')}_{ts}.xlsx")
-        with open(report_file, "wb") as f:
-            f.write(excel_bytes)
+        try:   # local copy is a convenience only; never block the history save
+            safe = re.sub(r"[^A-Za-z0-9_-]", "_", client_name.strip())
+            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_file = os.path.join(REPORTS_DIR, f"PayMatch_{safe}_{period.replace(' ','_')}_{ts}.xlsx")
+            with open(report_file, "wb") as f:
+                f.write(excel_bytes)
+        except OSError:
+            report_file = ""
     try:
         existing = _sb().table("reconciliation_history").select("id,notes").eq("client", client_name).eq("period", period).execute()
         record = ReconciliationRecord(
@@ -1182,8 +1204,9 @@ def save_to_history(recon_df, client_name, period, excel_bytes=None):
             _sb().table("reconciliation_history").update(row).eq("client", client_name).eq("period", period).execute()
         else:
             _sb().table("reconciliation_history").insert(row).execute()
+        return True
     except Exception:
-        pass
+        return False
 
 def load_history(client_name=None):
     try:
@@ -1215,8 +1238,9 @@ def get_run_notes(client, period):
 def update_run_notes(client, period, notes):
     try:
         _sb().table("reconciliation_history").update({"notes": str(notes)}).eq("client", client).eq("period", period).execute()
+        return True
     except Exception:
-        pass
+        return False
 
 # ── LOGO (base64 for embedding in HTML header) ────────────────────
 @st.cache_resource
@@ -1231,18 +1255,6 @@ def _logo_b64() -> str:
 # STREAMLIT APP
 # ─────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PayMatch by ProPayHR", page_icon="📊", layout="wide")
-
-# ── KEEP-ALIVE ────────────────────────────────────────────────────
-@st.cache_resource
-def _start_keep_alive():
-    def _loop():
-        while True:
-            time.sleep(60)
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
-    return t
-
-_start_keep_alive()
 
 st.markdown(f"<style>{APP_CSS}</style>", unsafe_allow_html=True)
 
@@ -1334,10 +1346,10 @@ with right:
     mo_col, yr_col = st.columns(2)
     with mo_col:
         sel_month = st.selectbox("Month", options=MONTHS,
-            index=datetime.now().month - 1, key="period_month")
+            index=(datetime.now().month - 2) % 12, key="period_month")
     with yr_col:
         sel_year = st.number_input("Year", min_value=2020, max_value=2040,
-            value=datetime.now().year, step=1, key="period_year", format="%d")
+            value=datetime.now().year - (1 if datetime.now().month == 1 else 0), step=1, key="period_year", format="%d")
     period = f"{sel_month} {int(sel_year)}"
 
     tolerance = st.number_input("Acceptable Difference ($)", min_value=0.0, max_value=1.0,
@@ -1373,22 +1385,26 @@ if not ready and not run:
 if run:
     with st.spinner("Analyzing files and comparing broker enrollment against Paycor deductions…"):
         try:
-            paycor_df            = parse_paycor(paycor_file)
+            paycor_raw           = read_file(paycor_file)
+            paycor_df            = parse_paycor_df(paycor_raw)
             broker_df, crosswalk = parse_broker_and_crosswalk(broker_file)
             if len(paycor_df) == 0:
                 st.error(f"The Deduction Report ({paycor_file.name}) appears to be empty or couldn't be read. Make sure it's a valid Paycor export with at least one row of data.")
                 st.stop()
             if len(broker_df) == 0:
-                st.error(f"The Master Mapping Report ({broker_file.name}) appears to be empty or couldn't be read. Make sure the file has benefit labels in the second row and employee data below that.")
+                st.error(f"The Master Mapping Report ({broker_file.name}) appears to be empty or couldn't be read. Make sure it has one row per employee per benefit, with First Name, Last Name, Division, Benefit, and EE Cost columns.")
                 st.stop()
+            _rep_month = report_check_month(paycor_raw)
+            if _rep_month and _rep_month != period:
+                st.warning(f"The Deduction Report's paychecks are from {_rep_month}, but the month selected is {period}. "
+                           f"The eligibility check depends on the month, so set Month to {_rep_month.split()[0]} and run again.")
             _cds = paycor_df.attrs.get("check_dates")
             if _cds:
                 st.info("Deduction detail report detected. Using each location's latest regular payroll: "
                         + "; ".join(f"{k} {v}" for k, v in sorted(_cds.items())))
             recon_df = reconcile(broker_df, paycor_df, crosswalk, tolerance)
             recon_df = flag_status_conflicts(recon_df)
-            paycor_file.seek(0)
-            audit_df = run_audit_checks(read_file(paycor_file),
+            audit_df = run_audit_checks(paycor_raw,
                                         date(int(sel_year), MONTHS.index(sel_month) + 1, 1))
             if len(audit_df):
                 recon_df = pd.concat([recon_df, audit_df], ignore_index=True)
@@ -1396,7 +1412,8 @@ if run:
             st.session_state.last_run_ts = datetime.now()
             _excel_full    = build_excel(recon_df, client_name.strip(), period=period)
             _excel_actions = build_action_items_only(recon_df, client_name.strip())
-            save_to_history(recon_df, client_name.strip(), period, excel_bytes=_excel_full)
+            if not save_to_history(recon_df, client_name.strip(), period, excel_bytes=_excel_full):
+                st.warning("This run could not be saved to history, so it won't appear in the trend view. Your results and downloads below are still complete.")
 
             if len(recon_df) == 0:
                 st.warning("No matching employees found. Make sure first and last names are spelled the same way in both files, and that the enrollment file includes per-paycheck dollar amounts.")
@@ -1525,7 +1542,7 @@ if run:
                 st.error("A required column couldn't be found. Make sure the Deduction Report is a standard Paycor export and the enrollment file has employee names in columns labeled 'First Name' and 'Last Name'.")
             else:
                 st.error(f"Something went wrong while processing: {e}")
-            st.info("If the problem persists, double-check that the Deduction Report is from Paycor and the Master Mapping Report is your broker's enrollment file with benefit labels in the second row.")
+            st.info("If the problem persists, double-check that the Deduction Report is from Paycor and the Master Mapping Report is your broker's enrollment file with one row per employee per benefit.")
 
 # ── TREND VIEW (per-client, shown when a client name is entered) ──
 if client_name.strip():
@@ -1582,8 +1599,10 @@ if client_name.strip():
             st.session_state[_nk] = get_run_notes(client_name.strip(), period)
         st.text_area("Notes", key=_nk, placeholder="e.g. Sent corrections to payroll team on 6/10. 3 employees pending broker re-enrollment.", label_visibility="collapsed", height=100)
         if st.button("Save Notes", key="save_run_notes"):
-            update_run_notes(client_name.strip(), period, st.session_state[_nk])
-            st.success("Notes saved.")
+            if update_run_notes(client_name.strip(), period, st.session_state[_nk]):
+                st.success("Notes saved.")
+            else:
+                st.error("Notes could not be saved. Please try again.")
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ── FOOTER ────────────────────────────────────────────────────────
