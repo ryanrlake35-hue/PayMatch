@@ -1204,9 +1204,11 @@ def save_to_history(recon_df, client_name, period, excel_bytes=None):
             _sb().table("reconciliation_history").update(row).eq("client", client_name).eq("period", period).execute()
         else:
             _sb().table("reconciliation_history").insert(row).execute()
-        return True
-    except Exception:
-        return False
+        return ""
+    except Exception as e:
+        # Short reason for the on-screen warning; no data or keys included
+        reason = f"{type(e).__name__}: {str(e)}".replace(SUPABASE_KEY or "\0", "***")
+        return reason[:200] or type(e).__name__
 
 def load_history(client_name=None):
     try:
@@ -1412,8 +1414,10 @@ if run:
             st.session_state.last_run_ts = datetime.now()
             _excel_full    = build_excel(recon_df, client_name.strip(), period=period)
             _excel_actions = build_action_items_only(recon_df, client_name.strip())
-            if not save_to_history(recon_df, client_name.strip(), period, excel_bytes=_excel_full):
-                st.warning("This run could not be saved to history, so it won't appear in the trend view. Your results and downloads below are still complete.")
+            _save_err = save_to_history(recon_df, client_name.strip(), period, excel_bytes=_excel_full)
+            if _save_err:
+                st.warning("This run could not be saved to history, so it won't appear in the trend view. "
+                           f"Your results and downloads below are still complete. Reason: {_save_err}")
 
             if len(recon_df) == 0:
                 st.warning("No matching employees found. Make sure first and last names are spelled the same way in both files, and that the enrollment file includes per-paycheck dollar amounts.")
